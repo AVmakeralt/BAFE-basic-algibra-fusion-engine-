@@ -70,6 +70,33 @@ double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
 /* Cost of an entire graph (sum over nodes). */
 double bafe_cost_graph(const bafe_cost_model *m, const bafe_graph *g);
 
+/* Phase 3 (issue #5): Calibrate a cost model using a learned model.
+ *
+ * Takes a static cost model + a learned model (from profiling.h) and
+ * produces a calibrated cost model where the per-node weights are
+ * adjusted based on what the learned model discovered about actual
+ * runtime correlations.
+ *
+ * Mapping:
+ *   learned.weights[4] (log_flops)     -> scales alpha_flops
+ *   learned.weights[5] (log_bytes)     -> scales beta_bytes
+ *   learned.weights[3] (num_fused)     -> scales delta_fuse
+ *   learned.weights[6] (num_intermediates) -> scales gamma_intermediate
+ *
+ * The scaling is relative to the learned model's average weight, so
+ * features that matter more than average get amplified and vice versa.
+ *
+ * If the learned model is not valid, returns a copy of the static model.
+ */
+bafe_cost_model bafe_cost_model_calibrate(const bafe_cost_model *static_model,
+                                           const double *learned_weights,
+                                           int n_weights,
+                                           double learned_bias);
+
+/* Convenience: calibrate from the global learned model (from profiling.h).
+ * Returns a calibrated cost model, or the default if no learned model. */
+bafe_cost_model bafe_cost_model_calibrated_default(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -6,7 +6,9 @@
  */
 #include "bafe/cost.h"
 #include "bafe/ops.h"
+#include "bafe/profiling.h"
 #include <string.h>
+#include <math.h>
 
 bafe_cost_model bafe_cost_model_default(void) {
     bafe_cost_model m;
@@ -222,4 +224,69 @@ double bafe_cost_graph(const bafe_cost_model *m, const bafe_graph *g) {
                                               input_layouts, n->n_children, n->layout);
     }
     return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 3 (issue #5): Calibration                                     */
+/* ------------------------------------------------------------------ */
+
+static double _clamp_scale(double w, double avg) {
+    /* If the weight is near zero, the feature has no correlation with
+     * runtime — don't scale (return 1.0). */
+    if (fabs(w) < avg * 0.1) return 1.0;
+    double s = fabs(w) / avg;
+    if (s < 0.1) s = 0.1;
+    if (s > 10.0) s = 10.0;
+    return s;
+}
+
+bafe_cost_model bafe_cost_model_calibrate(const bafe_cost_model *static_model,
+                                           const double *learned_weights,
+                                           int n_weights,
+                                           double learned_bias) {
+    bafe_cost_model out = static_model ? *static_model : bafe_cost_model_default();
+    if (!learned_weights || n_weights < 8) return out;
+
+    double sum_abs = 0.0;
+    for (int i = 0; i < n_weights; i++) sum_abs += fabs(learned_weights[i]);
+    double avg_abs = sum_abs / (double)n_weights;
+    if (avg_abs < 1e-9) return out;
+
+    /* feature[4] = log_flops -> alpha_flops */
+    double s_flops = _clamp_scale(learned_weights[4], avg_abs);
+    out.alpha_flops = static_model->alpha_flops * s_flops;
+
+    /* feature[5] = log_bytes -> beta_bytes */
+    double s_bytes = _clamp_scale(learned_weights[5], avg_abs);
+    if (learned_weights[5] >= 0) {
+        out.beta_bytes = static_model->beta_bytes * s_bytes;
+    } else {
+        out.beta_bytes = static_model->beta_bytes / s_bytes;
+    }
+
+    /* feature[3] = num_fused -> delta_fuse */
+    double s_fused = _clamp_scale(learned_weights[3], avg_abs);
+    if (learned_weights[3] < 0) {
+        out.delta_fuse = static_model->delta_fuse * s_fused;
+    } else {
+        out.delta_fuse = static_model->delta_fuse / s_fused;
+    }
+
+    /* feature[6] = num_intermediates -> gamma_intermediate */
+    double s_inter = _clamp_scale(learned_weights[6], avg_abs);
+    if (learned_weights[6] >= 0) {
+        out.gamma_intermediate = static_model->gamma_intermediate * s_inter;
+    } else {
+        out.gamma_intermediate = static_model->gamma_intermediate / s_inter;
+    }
+
+    (void)learned_bias;
+    return out;
+}
+
+bafe_cost_model bafe_cost_model_calibrated_default(void) {
+    bafe_cost_model stat = bafe_cost_model_default();
+    const bafe_learned_cost_model *lm = bafe_profiling_get_model();
+    if (!lm || !lm->valid) return stat;
+    return bafe_cost_model_calibrate(&stat, lm->weights, 8, lm->bias);
 }

@@ -65,6 +65,11 @@ bafe_jit_stats bafe_jit_get_stats(void);
 /* For testing: clear all caches. */
 void bafe_jit_clear(void);
 
+/* Phase 3 (issue #5): Clear the in-memory JIT cache only (keep on-disk).
+ * Forces re-optimization on the next call, so the calibrated cost model
+ * gets a chance to pick a different kernel. */
+void bafe_jit_invalidate_memory_cache(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -328,3 +328,17 @@ void bafe_jit_clear(void) {
     _cache_n = 0;
     memset(&_stats, 0, sizeof(_stats));
 }
+
+void bafe_jit_invalidate_memory_cache(void) {
+    /* Close the dlopen'd handles but keep the on-disk .so files.
+     * The next bafe_jit_get_or_compile call will re-optimize (picking
+     * up the calibrated cost model) and may produce a different graph,
+     * which either hits the on-disk cache for the SAME hash or compiles
+     * a NEW .so for the new graph. */
+    for (int i = 0; i < _cache_n; i++) {
+        if (_cache[i].so_handle) dlclose(_cache[i].so_handle);
+    }
+    _cache_n = 0;
+    /* Note: we do NOT reset _stats here — hits/misses/compiles are
+     * cumulative across invalidations. */
+}

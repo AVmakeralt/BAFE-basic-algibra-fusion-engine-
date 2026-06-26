@@ -92,8 +92,10 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
     }
 #endif
 
-    /* Step 5: extract min-cost program */
-    bafe_cost_model cm = bafe_cost_model_default();
+    /* Step 5: extract min-cost program.
+     * Phase 3 (issue #5): use the calibrated cost model if a learned model
+     * is available; otherwise fall back to the static default. */
+    bafe_cost_model cm = bafe_cost_model_calibrated_default();
     bafe_plan plan;
     int eclass_to_plan[BAFE_EG_MAX_CLASSES];
     bafe_extract_run(eg, &cm, &work, &plan, eclass_to_plan);

@@ -156,6 +156,10 @@ _lib.bafe_cost_model_default.argtypes = []
 _lib.bafe_cost_model_default.restype = BafeCostModel
 _lib.bafe_cost_graph.argtypes = [POINTER(BafeCostModel), POINTER(BafeGraph)]
 _lib.bafe_cost_graph.restype = c_double
+_lib.bafe_cost_model_calibrate.argtypes = [POINTER(BafeCostModel), POINTER(c_double), c_int, c_double]
+_lib.bafe_cost_model_calibrate.restype = BafeCostModel
+_lib.bafe_cost_model_calibrated_default.argtypes = []
+_lib.bafe_cost_model_calibrated_default.restype = BafeCostModel
 _lib.bafe_rewrite_find.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList)]
 _lib.bafe_rewrite_find.restype = c_int
 _lib.bafe_rewrite_default_count.argtypes = []
@@ -285,6 +289,8 @@ _lib.bafe_autotune_get_config.argtypes = []
 _lib.bafe_autotune_get_config.restype = BafeAutotuneConfig
 _lib.bafe_autotune_get_stats.argtypes = []
 _lib.bafe_autotune_get_stats.restype = BafeAutotuneStats
+_lib.bafe_jit_invalidate_memory_cache.argtypes = []
+_lib.bafe_jit_invalidate_memory_cache.restype = None
 
 
 # types

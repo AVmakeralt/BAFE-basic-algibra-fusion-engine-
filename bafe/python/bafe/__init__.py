@@ -405,14 +405,16 @@ class JittedFunction:
                 )
 
                 # check if we should refit
-                # (the C side tracks samples_since_refit; we trigger refit
-                # when the log grows by refit_threshold since last refit)
                 log = _lib.bafe_profiling_get_log().contents
                 if log.n > 0 and log.n % config.refit_threshold == 0:
                     _lib.bafe_profiling_refit()
-                    # after refit, check if predictions drifted enough to
-                    # invalidate the cache. For now, we just log the refit;
-                    # full invalidation is a future enhancement.
+                    # Phase 3 (issue #5): after refit, invalidate the
+                    # Python-level compiled cache so the next call
+                    # re-optimizes with the calibrated cost model.
+                    # The C-level JIT cache is also invalidated so
+                    # dlopen'd handles are released.
+                    self._compiled.clear()
+                    _lib.bafe_jit_invalidate_memory_cache()
         else:
             kernel(*c_args)
 
@@ -691,6 +693,40 @@ def autotune_reset():
     _lib.bafe_profiling_reset()
 
 
+def calibrate():
+    """Build a calibrated cost model from the current learned model.
+
+    Returns a BafeCostModel that has its per-node weights adjusted based
+    on what the learned model discovered about actual runtime correlations.
+
+    If no learned model is available (no refit has happened yet), returns
+    the static default cost model.
+
+    The calibrated model is automatically used by bafe_optimize for all
+    subsequent extractions.
+    """
+    return _lib.bafe_cost_model_calibrated_default()
+
+
+def calibrated_cost_model() -> dict:
+    """Inspect the calibrated cost model (for debugging).
+
+    Returns a dict with the calibrated weights:
+        alpha_flops, beta_bytes, gamma_intermediate, delta_fuse,
+        epsilon_layout_conv, zeta_layout_fuse, eta_contiguous
+    """
+    cm = _lib.bafe_cost_model_calibrated_default()
+    return {
+        "alpha_flops": cm.alpha_flops,
+        "beta_bytes": cm.beta_bytes,
+        "gamma_intermediate": cm.gamma_intermediate,
+        "delta_fuse": cm.delta_fuse,
+        "epsilon_layout_conv": cm.epsilon_layout_conv,
+        "zeta_layout_fuse": cm.zeta_layout_fuse,
+        "eta_contiguous": cm.eta_contiguous,
+    }
+
+
 __all__ = [
     "Tensor", "jit", "optimize", "make_search_budget",
     "input", "matmul", "add", "sub", "mul", "relu", "sigmoid", "tanh",
@@ -698,5 +734,6 @@ __all__ = [
     "graph_summary",
     "configure_autotune", "autotune_stats", "autotune_refit",
     "autotune_model", "autotune_dump_log", "autotune_reset",
+    "calibrate", "calibrated_cost_model",
     "__version__",
 ]
