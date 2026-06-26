@@ -162,6 +162,48 @@ _lib.bafe_rewrite_default_count.argtypes = []
 _lib.bafe_rewrite_default_count.restype = c_int
 
 
+# Phase 2 (issue #1): stochastic search budget + stats
+class BafeSearchBudget(Structure):
+    _fields_ = [
+        ("max_iters", c_int),
+        ("max_nodes", c_int),
+        ("max_rewrites", c_int),
+        ("time_budget_ms", c_int),
+        ("temperature", c_double),
+        ("seed", c_uint32),
+        ("enable_multi_pass", c_bool),
+    ]
+
+
+class BafeSearchStats(Structure):
+    _fields_ = [
+        ("iters_done", c_int),
+        ("alts_found", c_int),
+        ("alts_materialized", c_int),
+        ("nodes_added", c_int),
+        ("elapsed_ms", c_double),
+    ]
+
+
+_lib.bafe_search_budget_default.argtypes = []
+_lib.bafe_search_budget_default.restype = BafeSearchBudget
+_lib.bafe_rewrite_stochastic.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList),
+                                          POINTER(BafeSearchBudget)]
+_lib.bafe_rewrite_stochastic.restype = c_int
+_lib.bafe_rewrite_stochastic_stats.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList),
+                                                POINTER(BafeSearchBudget),
+                                                POINTER(BafeSearchStats)]
+_lib.bafe_rewrite_stochastic_stats.restype = c_int
+_lib.bafe_optimize_with_budget.argtypes = [POINTER(BafeGraph), POINTER(BafeGraph),
+                                            POINTER(BafeSearchBudget),
+                                            c_char_p, c_size_t]
+_lib.bafe_optimize_with_budget.restype = c_int
+_lib.bafe_optimize_and_compile_with_budget.argtypes = [POINTER(BafeGraph),
+                                                        POINTER(BafeSearchBudget),
+                                                        c_char_p, c_size_t]
+_lib.bafe_optimize_and_compile_with_budget.restype = c_void_p
+
+
 # types
 _lib.bafe_dtype_c_name.argtypes = [c_int]
 _lib.bafe_dtype_c_name.restype = c_char_p

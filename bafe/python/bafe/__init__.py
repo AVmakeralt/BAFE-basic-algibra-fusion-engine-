@@ -306,11 +306,15 @@ class JittedFunction:
       5. Invokes the kernel
 
     Subsequent calls with the same shapes/dtypes hit the JIT cache.
+
+    Phase 2 (issue #1): if a search budget is set, uses stochastic
+    multi-pass search to discover deeper rewrites.
     """
 
-    def __init__(self, fn: Callable):
+    def __init__(self, fn: Callable, budget=None):
         self._fn = fn
-        self._compiled = {}  # key: (shapes, dtypes) -> (fn_ptr, sig, out_shape)
+        self._budget = budget  # BafeSearchBudget or None (deterministic)
+        self._compiled = {}  # key: (shapes, dtypes, layouts) -> (fn_ptr, sig, out_shape, out_dtype)
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args: np.ndarray) -> np.ndarray:
@@ -395,14 +399,24 @@ class JittedFunction:
             _TRACE = None
 
         # optimize + compile
+        # Phase 2 (issue #1): if a budget is set, use stochastic multi-pass search
         optimized = BafeGraph()
         err_buf = ctypes.create_string_buffer(256)
-        rc = _lib.bafe_optimize(
-            ctypes.byref(in_graph),
-            ctypes.byref(optimized),
-            err_buf,
-            ctypes.c_size_t(len(err_buf)),
-        )
+        if self._budget is not None:
+            rc = _lib.bafe_optimize_with_budget(
+                ctypes.byref(in_graph),
+                ctypes.byref(optimized),
+                ctypes.byref(self._budget),
+                err_buf,
+                ctypes.c_size_t(len(err_buf)),
+            )
+        else:
+            rc = _lib.bafe_optimize(
+                ctypes.byref(in_graph),
+                ctypes.byref(optimized),
+                err_buf,
+                ctypes.c_size_t(len(err_buf)),
+            )
         if rc != 0:
             raise RuntimeError(
                 f"bafe_optimize failed (code {rc}): {err_buf.value.decode()}"
@@ -432,9 +446,75 @@ class JittedFunction:
         return (fn_ptr, sig, in_dtypes, out_shape, out_np_dt)
 
 
-def jit(fn: Callable) -> JittedFunction:
-    """Decorator: trace + optimize + JIT-compile a tensor function."""
-    return JittedFunction(fn)
+def jit(fn: Callable = None, *, budget=None, iters: int = None,
+        temperature: float = None, seed: int = None):
+    """Decorator: trace + optimize + JIT-compile a tensor function.
+
+    Phase 2 (issue #1): optional stochastic search parameters.
+
+    Args:
+        budget: a BafeSearchBudget for full control. If None and no other
+                params are given, uses deterministic single-pass search.
+        iters: number of stochastic passes (default 4 if budget mode on).
+        temperature: 0.0 = greedy, high = explore randomly (default 1.0).
+        seed: PRNG seed for reproducibility (default 0xBAFE5EED).
+
+    Examples:
+        @bafe.jit
+        def f(A, B): ...                      # deterministic (default)
+
+        @bafe.jit(iters=8, temperature=2.0)
+        def f(A, B): ...                      # stochastic, 8 passes
+
+        budget = bafe.SearchBudget(iters=16, max_nodes=500, seed=42)
+        @bafe.jit(budget=budget)
+        def f(A, B): ...                      # full custom budget
+    """
+    # Support both @bafe.jit and @bafe.jit(...) usage
+    if fn is not None:
+        # called as @bafe.jit (no parentheses)
+        return JittedFunction(fn)
+
+    def deco(fn):
+        b = budget
+        if b is None and (iters is not None or temperature is not None or seed is not None):
+            # build a budget from individual params
+            b = make_search_budget(
+                max_iters=iters if iters is not None else 4,
+                temperature=temperature if temperature is not None else 1.0,
+                seed=seed if seed is not None else 0xBAFE5EED,
+            )
+        return JittedFunction(fn, budget=b)
+    return deco
+
+
+def make_search_budget(max_iters: int = 4, max_nodes: int = 256,
+                       max_rewrites: int = 64, time_budget_ms: int = 0,
+                       temperature: float = 1.0, seed: int = 0xBAFE5EED,
+                       enable_multi_pass: bool = True):
+    """Build a BafeSearchBudget for use with @bafe.jit(budget=...).
+
+    The budget controls the stochastic search layer:
+      - max_iters: how many stochastic passes (each pass re-applies rules
+        to newly-created nodes, discovering deeper rewrites)
+      - max_nodes: hard cap on graph size during search
+      - max_rewrites: cap on total rewrites materialized
+      - time_budget_ms: wall-clock limit (0 = no limit)
+      - temperature: 0.0 = greedy (only cost-reducing rewrites),
+                     high = explore randomly
+      - seed: PRNG seed for reproducibility
+      - enable_multi_pass: if False, degrades to deterministic single-pass
+    """
+    from bafe._binding import BafeSearchBudget
+    b = BafeSearchBudget()
+    b.max_iters = int(max_iters)
+    b.max_nodes = int(max_nodes)
+    b.max_rewrites = int(max_rewrites)
+    b.time_budget_ms = int(time_budget_ms)
+    b.temperature = float(temperature)
+    b.seed = int(seed) & 0xFFFFFFFF
+    b.enable_multi_pass = bool(enable_multi_pass)
+    return b
 
 
 # expose the optimize function for low-level use
@@ -449,7 +529,7 @@ def optimize(graph: BafeGraph) -> BafeGraph:
 
 
 __all__ = [
-    "Tensor", "jit", "optimize",
+    "Tensor", "jit", "optimize", "make_search_budget",
     "input", "matmul", "add", "sub", "mul", "relu", "sigmoid", "tanh",
     "bias_add", "transpose", "reduce_sum", "reduce_max", "reshape", "broadcast_to",
     "graph_summary",

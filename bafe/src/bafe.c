@@ -1,28 +1,64 @@
 /* bafe/bafe.c - top-level BAFE API: optimize + compile
  *
  * Pipeline:
- *   1. Import input graph into e-graph
- *   2. Find rewrite alternatives
- *   3. Apply alternatives (declare equivalences)
- *   4. Rebuild (congruence closure)
- *   5. Extract min-cost program (DP)
- *   6. Build optimized graph from extraction
- *   7. JIT compile
+ *   1. (Optional) Run stochastic multi-pass search on a working copy
+ *   2. Import the (possibly expanded) graph into e-graph
+ *   3. Find rewrite alternatives (deterministic, on the working copy)
+ *   4. Apply alternatives (declare equivalences)
+ *   5. Rebuild (congruence closure)
+ *   6. Extract min-cost program (DP)
+ *   7. Build optimized graph from extraction
+ *   8. JIT compile
  */
 #include "bafe/bafe.h"
 #include "bafe/rewrite.h"
 #include "bafe/codegen.h"
+#include "bafe/search.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
-                  char *err_buf, size_t err_buf_size) {
+int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
+                               const bafe_search_budget *budget_in,
+                               char *err_buf, size_t err_buf_size) {
     if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
+    bafe_search_budget budget = budget_in ? *budget_in : bafe_search_budget_default();
 
     bafe_graph_init(optimized);
 
-    /* Step 1: import input graph into e-graph (heap-allocated, ~12MB) */
+    /* Step 0: make a working copy of the input graph.
+     * The stochastic search mutates the graph (adds new nodes when
+     * materializing alternatives), so we must not touch the caller's input. */
+    bafe_graph work;
+    bafe_graph_init(&work);
+    /* copy nodes from input -> work */
+    for (int i = 0; i < input->n_nodes; i++) {
+        work.nodes[i] = input->nodes[i];
+    }
+    work.n_nodes = input->n_nodes;
+    for (int i = 0; i < input->n_inputs; i++) work.inputs[i] = input->inputs[i];
+    work.n_inputs = input->n_inputs;
+    for (int i = 0; i < input->n_outputs; i++) work.outputs[i] = input->outputs[i];
+    work.n_outputs = input->n_outputs;
+
+    /* Step 1: run stochastic multi-pass search on the working copy.
+     * This materializes selected alternatives as new nodes, which the
+     * next pass can match rules against — discovering deeper rewrites. */
+    bafe_alt_list alts;
+    bafe_search_stats search_stats;
+    int n_alts = bafe_rewrite_stochastic_stats(&work, &alts, &budget, &search_stats);
+    (void)n_alts;
+    (void)search_stats;
+
+#ifdef BAFE_DEBUG
+    printf("[bafe_optimize] stochastic search: %d iters, %d alts found, %d materialized, %d nodes added\n",
+           search_stats.iters_done, search_stats.alts_found,
+           search_stats.alts_materialized, search_stats.nodes_added);
+    printf("[bafe_optimize] working graph grew from %d to %d nodes\n",
+           input->n_nodes, work.n_nodes);
+#endif
+
+    /* Step 2: import the (possibly expanded) working graph into e-graph */
     bafe_egraph *eg = (bafe_egraph *)malloc(sizeof(bafe_egraph));
     if (!eg) {
         if (err_buf) snprintf(err_buf, err_buf_size, "out of memory");
@@ -30,44 +66,29 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
     }
     bafe_egraph_init(eg);
     bafe_eclass_id node_to_eclass[BAFE_MAX_NODES];
-    for (int i = 0; i < input->n_nodes; i++) node_to_eclass[i] = -1;
-    bafe_egraph_import_graph(eg, input, node_to_eclass);
+    for (int i = 0; i < work.n_nodes; i++) node_to_eclass[i] = -1;
+    bafe_egraph_import_graph(eg, &work, node_to_eclass);
 
-    /* Step 2: find rewrite alternatives */
-    bafe_alt_list alts;
-    bafe_rewrite_find(input, &alts);
 #ifdef BAFE_DEBUG
-    printf("[bafe_optimize] found %d alternatives:\n", alts.n);
-    for (int i = 0; i < alts.n; i++) {
-        printf("  alt %d: node %d -> %s(", i, alts.items[i].original_node_id, alts.items[i].op_name);
-        for (int j = 0; j < alts.items[i].n_children; j++) {
-            printf("%s%d", j == 0 ? "" : ",", alts.items[i].children[j]);
-        }
-        printf(")\n");
-    }
     {
         char dbg[8192];
         bafe_egraph_dump(eg, dbg, sizeof(dbg));
-        printf("[bafe_optimize] after import (before alternatives applied):\n%s\n", dbg);
+        printf("[bafe_optimize] after import:\n%s\n", dbg);
     }
 #endif
 
     /* Step 3: apply alternatives (declare equivalences) */
-    bafe_egraph_apply_alternatives(eg, input, node_to_eclass, &alts);
+    bafe_egraph_apply_alternatives(eg, &work, node_to_eclass, &alts);
 
-    /* Step 4: rebuild (saturate congruence closure) */
+    /* Step 4: rebuild (congruence closure) */
     int iters = bafe_egraph_rebuild(eg, 100);
     (void)iters;
+
 #ifdef BAFE_DEBUG
     {
         char dbg[8192];
         bafe_egraph_dump(eg, dbg, sizeof(dbg));
         printf("[bafe_optimize] after rebuild (%d iters):\n%s\n", iters, dbg);
-        printf("[bafe_optimize] node_to_eclass:");
-        for (int i = 0; i < input->n_nodes; i++) {
-            printf(" n%d->e%d(find=%d)", i, node_to_eclass[i], bafe_egraph_find(eg, node_to_eclass[i]));
-        }
-        printf("\n");
     }
 #endif
 
@@ -75,48 +96,34 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
     bafe_cost_model cm = bafe_cost_model_default();
     bafe_plan plan;
     int eclass_to_plan[BAFE_EG_MAX_CLASSES];
-    bafe_extract_run(eg, &cm, input, &plan, eclass_to_plan);
+    bafe_extract_run(eg, &cm, &work, &plan, eclass_to_plan);
 
-    /* Step 6: build optimized graph from extraction, rooted at the
-     * e-class of the input's output node. */
-    if (input->n_outputs == 0) {
+    /* Step 6: build optimized graph from extraction */
+    if (work.n_outputs == 0) {
         if (err_buf) snprintf(err_buf, err_buf_size, "input has no outputs");
         free(eg);
         return 1;
     }
-    bafe_eclass_id root_eclass = node_to_eclass[input->outputs[0]];
+    bafe_eclass_id root_eclass = node_to_eclass[work.outputs[0]];
 
-    /* We need to copy the input/constant nodes from the original graph
-     * into the optimized graph, and map e-class ids to the new node ids.
-     * Strategy: build a fresh graph from scratch by walking the plan.
-     * We need a separate mapping from original input node ids to new
-     * input node ids. */
-
-    /* First, add all inputs to the optimized graph (same shapes/names). */
     bafe_eclass_id new_eclass_to_node[BAFE_EG_MAX_CLASSES];
     for (int i = 0; i < BAFE_EG_MAX_CLASSES; i++) new_eclass_to_node[i] = -1;
-    int eclass_visited[BAFE_EG_MAX_CLASSES];
-    for (int i = 0; i < BAFE_EG_MAX_CLASSES; i++) eclass_visited[i] = 0;
 
-    /* We need a mapping from the original graph's input nodes to the
-     * e-class ids they were imported as, so that when we encounter an
-     * input e-node in the plan, we can find its original shape/name. */
+    /* map from eclass -> original input node id (for shape/name recovery) */
     bafe_node_id eclass_to_input_origin[BAFE_EG_MAX_CLASSES];
     for (int i = 0; i < BAFE_EG_MAX_CLASSES; i++) eclass_to_input_origin[i] = -1;
-    for (int i = 0; i < input->n_inputs; i++) {
-        bafe_node_id nid = input->inputs[i];
+    for (int i = 0; i < work.n_inputs; i++) {
+        bafe_node_id nid = work.inputs[i];
         bafe_eclass_id cid = bafe_egraph_find(eg, node_to_eclass[nid]);
         eclass_to_input_origin[cid] = nid;
     }
 
-    /* Walk the plan recursively and build the optimized graph. */
-    /* Custom recursion that also handles inputs and constants. */
-    /* We'll do an explicit stack-based DFS. */
+    /* iterative DFS to build the optimized graph */
     typedef struct {
         bafe_eclass_id eclass;
-        int state;  /* 0 = unvisited, 1 = children done */
+        int state;
     } stack_entry;
-    stack_entry stack[256];
+    stack_entry stack[512];
     int sp = 0;
     stack[sp].eclass = bafe_egraph_find(eg, root_eclass);
     stack[sp].state = 0;
@@ -126,7 +133,7 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
         stack_entry *top = &stack[sp - 1];
         bafe_eclass_id cid = top->eclass;
         if (new_eclass_to_node[cid] >= 0) {
-            sp--;  /* already built */
+            sp--;
             continue;
         }
         int plan_idx = eclass_to_plan[cid];
@@ -142,7 +149,6 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
             return 8;
         }
         if (top->state == 0) {
-            /* check if this is an input or constant eclass */
             if (strcmp(p->enode.op_name, "input") == 0) {
                 bafe_node_id orig = eclass_to_input_origin[cid];
                 if (orig < 0) {
@@ -150,8 +156,7 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
                     free(eg);
                     return 3;
                 }
-                const bafe_node *orig_node = &input->nodes[orig];
-                /* Phase 2: preserve the input's layout tag through optimization */
+                const bafe_node *orig_node = &work.nodes[orig];
                 bafe_node_id new_id = bafe_graph_add_input_with_layout(
                     optimized, orig_node->input_name,
                     &orig_node->shape, orig_node->dtype, orig_node->layout);
@@ -167,12 +172,11 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
                 sp--;
                 continue;
             }
-            /* push children */
             top->state = 1;
             for (int j = p->enode.n_children - 1; j >= 0; j--) {
                 bafe_eclass_id child_root = bafe_egraph_find(eg, p->enode.children[j]);
                 if (new_eclass_to_node[child_root] < 0) {
-                    if (sp >= 256) {
+                    if (sp >= 512) {
                         if (err_buf) snprintf(err_buf, err_buf_size, "stack overflow");
                         free(eg);
                         return 4;
@@ -184,7 +188,6 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
             }
             continue;
         }
-        /* state == 1: children done, build this node */
         bafe_node_id children[BAFE_MAX_CHILDREN];
         for (int j = 0; j < p->enode.n_children; j++) {
             bafe_eclass_id child_root = bafe_egraph_find(eg, p->enode.children[j]);
@@ -212,11 +215,30 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
     return 0;
 }
 
+int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
+                  char *err_buf, size_t err_buf_size) {
+    /* default: deterministic single-pass (multi_pass disabled) */
+    bafe_search_budget b = bafe_search_budget_default();
+    b.enable_multi_pass = false;
+    return bafe_optimize_with_budget(input, optimized, &b, err_buf, err_buf_size);
+}
+
 bafe_kernel_fn bafe_optimize_and_compile(const bafe_graph *input,
                                           char *err_buf, size_t err_buf_size) {
     if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
     bafe_graph optimized;
     if (bafe_optimize(input, &optimized, err_buf, err_buf_size) != 0) {
+        return NULL;
+    }
+    return bafe_jit_get_or_compile(&optimized, err_buf, err_buf_size);
+}
+
+bafe_kernel_fn bafe_optimize_and_compile_with_budget(const bafe_graph *input,
+                                                      const bafe_search_budget *budget,
+                                                      char *err_buf, size_t err_buf_size) {
+    if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
+    bafe_graph optimized;
+    if (bafe_optimize_with_budget(input, &optimized, budget, err_buf, err_buf_size) != 0) {
         return NULL;
     }
     return bafe_jit_get_or_compile(&optimized, err_buf, err_buf_size);

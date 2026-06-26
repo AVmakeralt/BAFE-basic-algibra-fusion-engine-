@@ -124,6 +124,69 @@ def g(A, B):
     return bafe.matmul(a, b)
 ```
 
+## Phase 2: Stochastic search layer
+
+The deterministic rewrite engine does **one pass** — it applies every
+rule to every node once. It never re-applies rules to the *new* nodes
+created by previous rewrites, so multi-step transformations are missed.
+
+The stochastic search layer fixes this by doing **multiple passes**:
+after each pass, materialized alternatives create new nodes, which the
+next pass can match rules against — discovering deeper rewrites.
+
+### Stochastic vs deterministic
+
+```
+Graph: relu(add(matmul(A, B), mul(C, D)))
+
+  Deterministic single-pass:  2 alternatives found
+  Stochastic (5 iters, T=2):  32 alternatives found  (16x more)
+                               62 rewrites materialized
+                               graph grew from 8 to 70 nodes
+```
+
+### Using stochastic search from Python
+
+```python
+import bafe
+
+# Default: deterministic (backward compatible)
+@bafe.jit
+def f(A, B):
+    return bafe.matmul(A, B)
+
+# Stochastic: pass iters/temperature/seed
+@bafe.jit(iters=8, temperature=2.0, seed=42)
+def f(A, B):
+    return bafe.matmul(A, B)
+
+# Full custom budget
+budget = bafe.make_search_budget(
+    max_iters=16, max_nodes=500, max_rewrites=200,
+    time_budget_ms=100, temperature=1.5, seed=42,
+)
+@bafe.jit(budget=budget)
+def f(A, B):
+    return bafe.matmul(A, B)
+```
+
+### Budget parameters
+
+| Parameter         | Default   | Description                                |
+|-------------------|-----------|--------------------------------------------|
+| `max_iters`       | 4         | Number of stochastic passes                |
+| `max_nodes`       | 256       | Hard cap on graph size during search       |
+| `max_rewrites`    | 64        | Cap on total rewrites materialized         |
+| `time_budget_ms`  | 0         | Wall-clock limit (0 = no limit)            |
+| `temperature`     | 1.0       | 0 = greedy, high = explore randomly        |
+| `seed`            | 0xBAFE5EED| PRNG seed for reproducibility              |
+| `enable_multi_pass` | true    | If false, degrades to deterministic        |
+
+The temperature controls a Boltzmann acceptance criterion:
+`P(materialize) = exp(-cost_delta / T)`. At low T, only cost-reducing
+rewrites are materialized. At high T, all rewrites are roughly equally
+likely (exploration).
+
 ## Phase 1 scope (this prototype)
 
 - IR with 17 ops (matmul, add, mul, sub, relu, sigmoid, tanh, neg,
