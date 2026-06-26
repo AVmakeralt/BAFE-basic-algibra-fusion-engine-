@@ -54,14 +54,26 @@ class _TraceContext:
         self.inputs: List[Tuple[str, "Tensor"]] = []
         self.input_names: List[str] = []
 
-    def add_input(self, name: str, shape: Tuple[int, ...], dtype: int) -> int:
+    def add_input(self, name: str, shape: Tuple[int, ...], dtype: int,
+                  layout: int = 0) -> int:
+        """Add an input. layout is a bafe_layout enum value (0=row, 1=col)."""
         sh = make_shape(shape)
-        nid = _lib.bafe_graph_add_input(
-            ctypes.byref(self.graph),
-            name.encode("utf-8"),
-            ctypes.byref(sh),
-            ctypes.c_int(dtype),
-        )
+        if layout == 0:
+            # default row-major: use the plain add_input for backward compat
+            nid = _lib.bafe_graph_add_input(
+                ctypes.byref(self.graph),
+                name.encode("utf-8"),
+                ctypes.byref(sh),
+                ctypes.c_int(dtype),
+            )
+        else:
+            nid = _lib.bafe_graph_add_input_with_layout(
+                ctypes.byref(self.graph),
+                name.encode("utf-8"),
+                ctypes.byref(sh),
+                ctypes.c_int(dtype),
+                ctypes.c_int(layout),
+            )
         if nid < 0:
             raise RuntimeError(f"failed to add input {name}")
         self.input_names.append(name)
@@ -169,18 +181,28 @@ def _broadcast_shapes(a, b):
 # Op functions (used inside @bafe.jit functions)
 # ---------------------------------------------------------------------------
 
-def input(shape: Tuple[int, ...], dtype: str | np.dtype = "float32", name: str = "x") -> Tensor:
+def input(shape: Tuple[int, ...], dtype: str | np.dtype = "float32",
+          name: str = "x", layout: str = "row") -> Tensor:
     """Declare an input tensor.
 
     Usually called automatically by @bafe.jit based on the function's
     arguments, but can also be called explicitly.
+
+    layout: "row" (default, C order) or "col" (Fortran order).
+    The layout tag tells BAFE how the input data is stored in memory,
+    which affects codegen (access patterns) and the cost model
+    (conversion penalties, fusion bonuses).
     """
     tc = _ensure_trace()
     np_dt = np.dtype(dtype)
     if np_dt not in _NP_TO_BAFE:
         raise ValueError(f"unsupported dtype {dtype}; supported: {list(_NP_TO_BAFE)}")
     bafe_dt = _NP_TO_BAFE[np_dt]
-    nid = tc.add_input(name, tuple(int(s) for s in shape), bafe_dt)
+    layout_map = {"row": 0, "col": 1, "blocked": 2, "tc": 3}
+    if layout not in layout_map:
+        raise ValueError(f"unsupported layout {layout!r}; supported: {list(layout_map)}")
+    bafe_layout = layout_map[layout]
+    nid = tc.add_input(name, tuple(int(s) for s in shape), bafe_dt, layout=bafe_layout)
     return Tensor(nid, tuple(int(s) for s in shape), bafe_dt, name=name)
 
 
@@ -299,8 +321,13 @@ class JittedFunction:
             if not isinstance(a, np.ndarray):
                 raise TypeError(f"expected numpy array, got {type(a)}")
 
-        # build cache key
-        key = tuple((a.shape, str(a.dtype)) for a in args)
+        # build cache key (Phase 2: include layout so row-major vs col-major
+        # inputs produce different compiled kernels)
+        def _layout_of(a):
+            if a.ndim >= 2 and a.flags["F_CONTIGUOUS"] and not a.flags["C_CONTIGUOUS"]:
+                return "col"
+            return "row"
+        key = tuple((a.shape, str(a.dtype), _layout_of(a)) for a in args)
 
         if key not in self._compiled:
             self._compiled[key] = self._compile(args)
@@ -311,9 +338,18 @@ class JittedFunction:
         out = np.zeros(out_shape, dtype=out_dtype)
 
         # build arg list: inputs + output pointer
+        # Phase 2: preserve the input's memory layout — if we compiled for
+        # col-major, the array must stay col-major (don't ascontiguousarray it).
         c_args = []
         for a, dt in zip(args, in_dtypes):
-            arr = np.ascontiguousarray(a, dtype=dt)
+            if a.dtype == dt:
+                arr = a
+            else:
+                # dtype conversion needed; preserve layout
+                if a.flags["F_CONTIGUOUS"] and not a.flags["C_CONTIGUOUS"]:
+                    arr = np.asfortranarray(a, dtype=dt)
+                else:
+                    arr = np.ascontiguousarray(a, dtype=dt)
             c_args.append(arr.ctypes.data_as(ctypes.c_void_p))
         c_args.append(out.ctypes.data_as(ctypes.c_void_p))
 
@@ -335,7 +371,14 @@ class JittedFunction:
                     raise TypeError(f"unsupported dtype {np_dt}")
                 bafe_dt = _NP_TO_BAFE[np_dt]
                 name = self._fn.__code__.co_varnames[i] if i < len(self._fn.__code__.co_varnames) else f"in{i}"
-                t = input(a.shape, np_dt, name=name)
+                # Phase 2: auto-detect input layout from numpy array flags
+                # If the array is Fortran-contiguous (col-major), tag it as "col".
+                # Otherwise default to "row" (C order).
+                if a.ndim >= 2 and a.flags["F_CONTIGUOUS"] and not a.flags["C_CONTIGUOUS"]:
+                    layout = "col"
+                else:
+                    layout = "row"
+                t = input(a.shape, np_dt, name=name, layout=layout)
                 in_tensors.append(t)
 
             # call the user function

@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 
 REPO = "AVmakeralt/BAFE-basic-algibra-fusion-engine-"
-TOKEN = "REDACTED"
+TOKEN = os.environ.get("BAFE_GITHUB_TOKEN", "")
 
 ISSUES = [
     {

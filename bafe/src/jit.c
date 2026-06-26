@@ -143,6 +143,7 @@ int bafe_jit_hash_graph(const bafe_graph *g, char *out, size_t out_size) {
         _sha256_update(&c, n->children, sizeof(bafe_node_id) * (size_t)n->n_children);
         _sha256_update(&c, &n->shape, sizeof(n->shape));
         _sha256_update(&c, &n->dtype, sizeof(n->dtype));
+        _sha256_update(&c, &n->layout, sizeof(n->layout));  /* Phase 2 */
         if (n->is_input) _sha256_update(&c, n->input_name, strlen(n->input_name) + 1);
         if (n->is_constant) _sha256_update(&c, &n->const_value, sizeof(n->const_value));
     }

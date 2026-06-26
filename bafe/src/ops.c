@@ -135,6 +135,7 @@ static const bafe_op _OPS[] = {
     {"sigmoid", 1, false, "bafe_sigmoid", _unary},
     {"tanh",    1, false, "bafe_tanh",    _unary},
     {"neg",     1, false, "bafe_neg",     _unary},
+    {"layout_transform", 1, false, "bafe_layout_transform", _unary},
     {"transpose",1,false, "bafe_transpose",_transpose},
     {"reduce_sum",1,false,"bafe_reduce_sum",_reduce},
     {"reduce_max",1,false,"bafe_reduce_max",_reduce},
@@ -166,6 +167,11 @@ const bafe_op *bafe_op_at(int i) {
 bool bafe_op_is_fused(const char *op_name) {
     if (!op_name) return false;
     return strncmp(op_name, "fused_", 6) == 0;
+}
+
+bool bafe_op_is_layout_transform(const char *op_name) {
+    if (!op_name) return false;
+    return strcmp(op_name, "layout_transform") == 0;
 }
 
 void bafe_op_registry_init(void) {

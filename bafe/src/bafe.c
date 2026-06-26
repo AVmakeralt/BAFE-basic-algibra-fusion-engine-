@@ -151,8 +151,10 @@ int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
                     return 3;
                 }
                 const bafe_node *orig_node = &input->nodes[orig];
-                bafe_node_id new_id = bafe_graph_add_input(optimized, orig_node->input_name,
-                                                            &orig_node->shape, orig_node->dtype);
+                /* Phase 2: preserve the input's layout tag through optimization */
+                bafe_node_id new_id = bafe_graph_add_input_with_layout(
+                    optimized, orig_node->input_name,
+                    &orig_node->shape, orig_node->dtype, orig_node->layout);
                 new_eclass_to_node[cid] = new_id;
                 sp--;
                 continue;

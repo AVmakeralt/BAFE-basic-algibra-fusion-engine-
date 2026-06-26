@@ -19,3 +19,4 @@ build/
 .mypy_cache/
 .ruff_cache/
 bafe/build/
+tool-results/

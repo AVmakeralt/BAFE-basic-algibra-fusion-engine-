@@ -68,18 +68,77 @@ ref = np.maximum(A @ B + C, 0.0).astype(np.float32)
 assert np.allclose(out, ref, atol=1e-4)
 ```
 
+## Phase 2: Layout superoptimizer
+
+BAFE now treats memory layout as a **first-class variable** that the
+optimizer explores. Every IR node carries a `bafe_layout` tag
+(`ROW_MAJOR`, `COL_MAJOR`, `BLOCKED`, `TENSOR_CORE`), and the optimizer
+uses this tag to:
+
+1. **Pick cache-friendly access patterns** in codegen
+   (e.g., `B[k + j*K]` for col-major B instead of `B[k*N + j]`)
+2. **Reward layout-compatible fusion** in the cost model
+3. **Eliminate redundant transposes** via rewrite rules
+   (`transpose(col_major_x) === x` — a free metadata flip)
+
+### Layout-aware matmul benchmark
+
+```
+matmul(256x256, 256x256) benchmark
+
+  numpy (row+row):       0.11 ms
+  BAFE row+row:         10.09 ms
+  BAFE row+col:          6.84 ms   <-- 1.47x faster than row+row
+
+  Correctness:
+    row+row max err: 4.96e-05
+    row+col max err: 4.96e-05
+```
+
+The col-major B variant emits `B_ptr[K*j + k]` (k contiguous in the
+inner loop) instead of `B_ptr[k*N + j]` (j contiguous, strided). This
+gives a measurable 1.47x speedup on 256x256 matmuls.
+
+### Using layouts from Python
+
+```python
+import numpy as np
+import bafe
+
+@bafe.jit
+def f(A, B):
+    return bafe.matmul(A, B)
+
+# Auto-detection: BAFE reads numpy's F_CONTIGUOUS flag
+A = np.random.randn(256, 256).astype(np.float32)
+B = np.random.randn(256, 256).astype(np.float32)
+B_col = np.asfortranarray(B)   # col-major
+
+out = f(A, B_col)   # BAFE compiles a col-major variant automatically
+
+# Explicit tagging (overrides auto-detection):
+@bafe.jit
+def g(A, B):
+    a = bafe.input(A.shape, dtype="float32", name="A", layout="row")
+    b = bafe.input(B.shape, dtype="float32", name="B", layout="col")
+    return bafe.matmul(a, b)
+```
+
 ## Phase 1 scope (this prototype)
 
-- IR with 16 ops (matmul, add, mul, sub, relu, sigmoid, tanh, neg,
+- IR with 17 ops (matmul, add, mul, sub, relu, sigmoid, tanh, neg,
   transpose, reduce_sum, reduce_max, reshape, broadcast_to, scale,
-  bias_add, and 4 fused forms)
-- 13 deterministic rewrite rules (algebra + fusion)
+  bias_add, layout_transform, and 4 fused forms)
+- 16 deterministic rewrite rules (algebra + fusion + layout)
 - E-graph with union-find + congruence closure rebuild
-- Cost model: FLOPs, memory traffic, intermediate-tensor cost, fusion bonus
+- Cost model: FLOPs, memory traffic, intermediate-tensor cost, fusion bonus,
+  layout conversion cost, layout-compatible fusion bonus, contiguous access bonus
 - DP extractor (min-cost subtree)
-- C99 codegen: real nested loops, tiled matmul, fused kernels
-- JIT cache: SHA-256 keyed, compiled with `cc`, `dlopen`'d at runtime
-- Python frontend: `@bafe.jit` decorator + functional ops
+- C99 codegen: real nested loops, tiled matmul, **layout-aware access patterns**,
+  fused kernels
+- JIT cache: SHA-256 keyed (includes layout), compiled with `cc`, `dlopen`'d at runtime
+- Python frontend: `@bafe.jit` decorator + functional ops + **layout auto-detection**
+  from numpy array flags
 
 ## Phase 2 (planned)
 

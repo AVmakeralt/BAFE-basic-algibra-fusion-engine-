@@ -62,6 +62,16 @@ void bafe_op_registry_init(void);
 /* Default attrs (all-zero). */
 bafe_op_attrs bafe_op_attrs_default(void);
 
+/* Phase 2: layout transform op.
+ * `layout_transform(x, target_layout)` returns a tensor with the same
+ * values as x but stored in target_layout. It is a no-op at the math
+ * level but tells the codegen to emit a layout conversion (or to track
+ * that the consumer should read with a different stride).
+ *
+ * The target_layout is stored in attrs.name as a string to avoid
+ * extending the attrs struct. */
+bool bafe_op_is_layout_transform(const char *op_name);
+
 #ifdef __cplusplus
 }
 #endif

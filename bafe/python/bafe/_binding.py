@@ -91,6 +91,7 @@ class BafeNode(Structure):
         ("children", c_int32 * BAFE_MAX_CHILDREN),
         ("shape", BafeShape),
         ("dtype", c_int),
+        ("layout", c_int),  # Phase 2: bafe_layout enum
         ("input_name", c_char * BAFE_MAX_ATTR_LEN),
         ("is_input", c_bool),
         ("is_constant", c_bool),
@@ -109,12 +110,56 @@ class BafeGraph(Structure):
     ]
 
 
+# Phase 2: rewrite alternatives (used by tests)
+BAFE_MAX_ALTERNATIVES = 512
+
+
+class BafeAlternative(Structure):
+    _fields_ = [
+        ("original_node_id", c_int32),
+        ("op_name", c_char_p),
+        ("attrs", BafeOpAttrs),
+        ("n_children", c_int),
+        ("children", c_int32 * BAFE_MAX_CHILDREN),
+    ]
+
+
+class BafeAltList(Structure):
+    _fields_ = [
+        ("items", BafeAlternative * BAFE_MAX_ALTERNATIVES),
+        ("n", c_int),
+    ]
+
+
+# Phase 2: cost model struct (used by tests)
+class BafeCostModel(Structure):
+    _fields_ = [
+        ("alpha_flops", c_double),
+        ("beta_bytes", c_double),
+        ("gamma_intermediate", c_double),
+        ("delta_fuse", c_double),
+        ("epsilon_layout_conv", c_double),
+        ("zeta_layout_fuse", c_double),
+        ("eta_contiguous", c_double),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Load library and set up function prototypes
 # ---------------------------------------------------------------------------
 
 _lib_path = _find_library()
 _lib = ctypes.CDLL(_lib_path)
+
+# Phase 2: rewrite + cost bindings (used by tests)
+_lib.bafe_cost_model_default.argtypes = []
+_lib.bafe_cost_model_default.restype = BafeCostModel
+_lib.bafe_cost_graph.argtypes = [POINTER(BafeCostModel), POINTER(BafeGraph)]
+_lib.bafe_cost_graph.restype = c_double
+_lib.bafe_rewrite_find.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList)]
+_lib.bafe_rewrite_find.restype = c_int
+_lib.bafe_rewrite_default_count.argtypes = []
+_lib.bafe_rewrite_default_count.restype = c_int
 
 
 # types
@@ -161,6 +206,12 @@ _lib.bafe_graph_init.argtypes = [POINTER(BafeGraph)]
 _lib.bafe_graph_init.restype = None
 _lib.bafe_graph_add_input.argtypes = [POINTER(BafeGraph), c_char_p, POINTER(BafeShape), c_int]
 _lib.bafe_graph_add_input.restype = c_int32
+_lib.bafe_graph_add_input_with_layout.argtypes = [POINTER(BafeGraph), c_char_p, POINTER(BafeShape), c_int, c_int]
+_lib.bafe_graph_add_input_with_layout.restype = c_int32
+_lib.bafe_graph_set_node_layout.argtypes = [POINTER(BafeGraph), c_int32, c_int]
+_lib.bafe_graph_set_node_layout.restype = c_int
+_lib.bafe_graph_get_node_layout.argtypes = [POINTER(BafeGraph), c_int32]
+_lib.bafe_graph_get_node_layout.restype = c_int
 _lib.bafe_graph_add_constant.argtypes = [POINTER(BafeGraph), c_double, POINTER(BafeShape), c_int]
 _lib.bafe_graph_add_constant.restype = c_int32
 _lib.bafe_graph_add.argtypes = [

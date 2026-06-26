@@ -180,9 +180,28 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
             int K = a->shape.dims[1];
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
+            /* Phase 2: layout-aware index expressions.
+             * A is (M, K): row-major -> A[i*K + k] (k contiguous, good)
+             *              col-major -> A[i + k*M] (i contiguous, bad for this loop order)
+             * B is (K, N): row-major -> B[k*N + j] (j contiguous)
+             *              col-major -> B[k + j*K] (k contiguous, GOOD for this loop order)
+             * Output (M, N): row-major -> out[i*N + j]
+             */
+            const char *a_idx = (a->layout == BAFE_LAYOUT_COL_MAJOR)
+                ? "%s[i + %d * k]"   /* col-major: A[i + M*k] */
+                : "%s[i * %d + k]";  /* row-major: A[i*K + k] */
+            const char *b_idx = (b->layout == BAFE_LAYOUT_COL_MAJOR)
+                ? "%s[%d * j + k]"   /* col-major: B[k + K*j] -- k contiguous! */
+                : "%s[k * %d + j]";  /* row-major: B[k*N + j] */
+            int a_stride = (a->layout == BAFE_LAYOUT_COL_MAJOR) ? M : K;
+            int b_stride = (b->layout == BAFE_LAYOUT_COL_MAJOR) ? K : N;
+            (void)b_stride;
             /* zero output */
             _append(out, out_size, &pos, "    for (int i = 0; i < %d*%d; i++) %s[i] = 0;\n", M, N, vname);
-            /* tiled matmul */
+            _append(out, out_size, &pos,
+                "    /* matmul: A layout=%s, B layout=%s */\n",
+                bafe_layout_name(a->layout), bafe_layout_name(b->layout));
+            /* tiled matmul with layout-aware access */
             _append(out, out_size, &pos,
                 "    for (int ii = 0; ii < %d; ii += %d) {\n"
                 "      for (int jj = 0; jj < %d; jj += %d) {\n"
@@ -190,8 +209,16 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "          for (int i = ii; i < ii + %d && i < %d; i++) {\n"
                 "            for (int j = jj; j < jj + %d && j < %d; j++) {\n"
                 "              float acc = 0.0f;\n"
-                "              for (int k = kk; k < kk + %d && k < %d; k++) {\n"
-                "                acc += %s[i * %d + k] * %s[k * %d + j];\n"
+                "              for (int k = kk; k < kk + %d && k < %d; k++) {\n",
+                M, MATMUL_TILE, N, MATMUL_TILE, K, MATMUL_TILE,
+                MATMUL_TILE, M, MATMUL_TILE, N,
+                MATMUL_TILE, K);
+            /* emit the access expression with layout-aware strides */
+            char a_expr[128], b_expr[128];
+            snprintf(a_expr, sizeof(a_expr), a_idx, a_name, a_stride);
+            snprintf(b_expr, sizeof(b_expr), b_idx, b_name, b_stride);
+            _append(out, out_size, &pos,
+                "                acc += %s * %s;\n"
                 "              }\n"
                 "              %s[i * %d + j] += acc;\n"
                 "            }\n"
@@ -199,9 +226,7 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "        }\n"
                 "      }\n"
                 "    }\n",
-                M, MATMUL_TILE, N, MATMUL_TILE, K, MATMUL_TILE,
-                MATMUL_TILE, M, MATMUL_TILE, N,
-                MATMUL_TILE, K, a_name, K, b_name, N, vname, N, vname);
+                a_expr, b_expr, vname, N, vname);
         } else if (strcmp(n->op_name, "add") == 0 || strcmp(n->op_name, "sub") == 0 ||
                    strcmp(n->op_name, "mul") == 0) {
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
@@ -273,9 +298,20 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 _append(out, out_size, &pos, "    /* reduce with axes/keepdims not implemented, zero fill */\n");
                 _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s[i] = 0;\n", numel, vname);
             }
-        } else if (strcmp(n->op_name, "reshape") == 0 || strcmp(n->op_name, "broadcast_to") == 0) {
+        } else if (strcmp(n->op_name, "reshape") == 0 ||
+                   strcmp(n->op_name, "broadcast_to") == 0 ||
+                   bafe_op_is_layout_transform(n->op_name)) {
+            /* Phase 2: layout_transform is a metadata change at the IR level,
+             * but at the C level we materialize it as a memcpy. The cost model
+             * penalizes this, so the optimizer prefers to eliminate redundant
+             * transforms via the layout rewrite rules. */
             char x_name[32]; _var_name(x_name, sizeof(x_name), g, n->children[0]);
-            _append(out, out_size, &pos, "    memcpy(%s, %s, %zu);\n", vname, x_name, numel * bafe_dtype_byte_size(n->dtype));
+            if (bafe_op_is_layout_transform(n->op_name)) {
+                _append(out, out_size, &pos, "    /* layout_transform to %s (data copy) */\n",
+                        n->attrs.name[0] ? n->attrs.name : "(default)");
+            }
+            _append(out, out_size, &pos, "    memcpy(%s, %s, %zu);\n", vname, x_name,
+                    numel * bafe_dtype_byte_size(n->dtype));
         } else if (strcmp(n->op_name, "fused_matmul_relu") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
             int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];

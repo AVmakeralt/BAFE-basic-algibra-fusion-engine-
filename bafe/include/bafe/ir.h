@@ -36,6 +36,7 @@ typedef struct {
     bafe_node_id   children[BAFE_MAX_CHILDREN];
     bafe_shape     shape;
     bafe_dtype     dtype;
+    bafe_layout    layout;       /* Phase 2: memory layout of this node's output */
     char           input_name[BAFE_MAX_ATTR_LEN]; /* for input nodes */
     bool           is_input;
     bool           is_constant;
@@ -57,11 +58,22 @@ void bafe_graph_init(bafe_graph *g);
 /* construction */
 bafe_node_id bafe_graph_add_input(bafe_graph *g, const char *name,
                                    const bafe_shape *shape, bafe_dtype dtype);
+bafe_node_id bafe_graph_add_input_with_layout(bafe_graph *g, const char *name,
+                                              const bafe_shape *shape,
+                                              bafe_dtype dtype,
+                                              bafe_layout layout);
 bafe_node_id bafe_graph_add_constant(bafe_graph *g, double value,
                                       const bafe_shape *shape, bafe_dtype dtype);
 bafe_node_id bafe_graph_add(bafe_graph *g, const char *op_name,
                              const bafe_node_id *children, int n_children,
                              const bafe_op_attrs *attrs);
+
+/* Set the layout of an existing node (used by the layout rewrite engine).
+ * Returns 0 on success, non-zero on error. */
+int bafe_graph_set_node_layout(bafe_graph *g, bafe_node_id id, bafe_layout layout);
+
+/* Get the layout of a node. */
+bafe_layout bafe_graph_get_node_layout(const bafe_graph *g, bafe_node_id id);
 
 /* convenience wrappers (return new node id, or -1 on error) */
 bafe_node_id bafe_graph_matmul(bafe_graph *g, bafe_node_id a, bafe_node_id b);

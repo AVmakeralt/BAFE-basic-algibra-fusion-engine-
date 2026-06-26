@@ -278,6 +278,113 @@ static int _fuse_matmul_bias_relu(const bafe_graph *g, const bafe_node *n, bafe_
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 2: Layout rewrite rules                                      */
+/* ------------------------------------------------------------------ */
+
+/* Rule: transpose(x, (1,0)) where x is col-major -> x (reinterpret as row-major)
+ *
+ * This is the "free transpose" rule. If x is stored col-major, then a logical
+ * 2D transpose is just a metadata change — no data movement needed. The
+ * resulting tensor has the same shape as x but with row-major layout.
+ *
+ * We express this as: transpose(x, (1,0)) === x  (when x is col-major)
+ * The e-graph merges these, and the extractor picks x (cheaper).
+ *
+ * Symmetrically: transpose(x, (1,0)) where x is row-major -> x (as col-major)
+ * This is also a free transpose, just in the other direction.
+ */
+static bool _free_transpose_col_applies(const bafe_graph *g, const bafe_node *n) {
+    if (!_is_op(n, "transpose")) return false;
+    if (n->attrs.n_perm != 2 || n->attrs.perm[0] != 1 || n->attrs.perm[1] != 0) return false;
+    const bafe_node *x = _child(g, n->children[0]);
+    return x->layout == BAFE_LAYOUT_COL_MAJOR && x->shape.rank == 2;
+}
+static int _free_transpose_col(const bafe_graph *g, const bafe_node *n, bafe_alternative *out) {
+    /* equivalent to: reshape(x) -- a no-op that reinterprets x with row-major layout.
+     * We use reshape (which inherits layout from its input in codegen) but we
+     * need to flip the layout. The cleanest way is to emit a layout_transform.
+     */
+    out->original_node_id = n->id;
+    out->op_name = "layout_transform";
+    out->attrs = bafe_op_attrs_default();
+    /* set the target layout to "row" via attrs.name */
+    strncpy(out->attrs.name, "row", BAFE_MAX_ATTR_LEN - 1);
+    out->attrs.name[BAFE_MAX_ATTR_LEN - 1] = '\0';
+    out->n_children = 1;
+    out->children[0] = n->children[0];
+    (void)g;
+    return 1;
+}
+
+static bool _free_transpose_row_applies(const bafe_graph *g, const bafe_node *n) {
+    if (!_is_op(n, "transpose")) return false;
+    if (n->attrs.n_perm != 2 || n->attrs.perm[0] != 1 || n->attrs.perm[1] != 0) return false;
+    const bafe_node *x = _child(g, n->children[0]);
+    return x->layout == BAFE_LAYOUT_ROW_MAJOR && x->shape.rank == 2;
+}
+static int _free_transpose_row(const bafe_graph *g, const bafe_node *n, bafe_alternative *out) {
+    /* transpose(row-major x) === layout_transform(x, "col") -- a metadata flip */
+    out->original_node_id = n->id;
+    out->op_name = "layout_transform";
+    out->attrs = bafe_op_attrs_default();
+    strncpy(out->attrs.name, "col", BAFE_MAX_ATTR_LEN - 1);
+    out->attrs.name[BAFE_MAX_ATTR_LEN - 1] = '\0';
+    out->n_children = 1;
+    out->children[0] = n->children[0];
+    (void)g;
+    return 1;
+}
+
+/* Rule: layout_transform(x, L) where x already has layout L -> x (redundant)
+ *
+ * Eliminates redundant layout_transform ops. This is critical for ensuring
+ * the e-graph doesn't accumulate no-op transforms.
+ */
+static bool _redundant_layout_transform_applies(const bafe_graph *g, const bafe_node *n) {
+    if (!bafe_op_is_layout_transform(n->op_name)) return false;
+    const bafe_node *x = _child(g, n->children[0]);
+    bafe_layout target;
+    if (strcmp(n->attrs.name, "row") == 0) target = BAFE_LAYOUT_ROW_MAJOR;
+    else if (strcmp(n->attrs.name, "col") == 0) target = BAFE_LAYOUT_COL_MAJOR;
+    else return false;
+    return x->layout == target;
+}
+static int _redundant_layout_transform(const bafe_graph *g, const bafe_node *n, bafe_alternative *out) {
+    /* layout_transform(x, L) === x  when x already has layout L */
+    out->original_node_id = n->id;
+    out->op_name = "reshape";   /* no-op reshape preserves shape and layout */
+    out->attrs = bafe_op_attrs_default();
+    const bafe_node *x = _child(g, n->children[0]);
+    out->attrs.n_shape = x->shape.rank;
+    for (int i = 0; i < x->shape.rank && i < BAFE_MAX_ATTR_LEN; i++) {
+        out->attrs.shape[i] = x->shape.dims[i];
+    }
+    out->n_children = 1;
+    out->children[0] = n->children[0];
+    return 1;
+}
+
+/* Rule: double layout_transform elimination
+ * layout_transform(layout_transform(x, L1), L2) === layout_transform(x, L2)
+ */
+static bool _double_layout_transform_applies(const bafe_graph *g, const bafe_node *n) {
+    if (!bafe_op_is_layout_transform(n->op_name)) return false;
+    const bafe_node *inner = _child(g, n->children[0]);
+    return bafe_op_is_layout_transform(inner->op_name);
+}
+static int _double_layout_transform(const bafe_graph *g, const bafe_node *n, bafe_alternative *out) {
+    /* compose: the outer target wins */
+    out->original_node_id = n->id;
+    out->op_name = "layout_transform";
+    out->attrs = bafe_op_attrs_default();
+    strncpy(out->attrs.name, n->attrs.name, BAFE_MAX_ATTR_LEN - 1);
+    out->attrs.name[BAFE_MAX_ATTR_LEN - 1] = '\0';
+    out->n_children = 1;
+    out->children[0] = g->nodes[n->children[0]].children[0];  /* inner's input */
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* Rule table                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -303,6 +410,11 @@ static const rule_def _RULES[] = {
     {"fuse_bias_relu",             _fuse_bias_relu_applies,      _fuse_bias_relu},
     {"fuse_matmul_bias",           _fuse_matmul_bias_applies,    _fuse_matmul_bias},
     {"fuse_matmul_bias_relu",      _fuse_matmul_bias_relu_applies,_fuse_matmul_bias_relu},
+    /* Phase 2: layout rules */
+    {"free_transpose_col_to_row",  _free_transpose_col_applies,  _free_transpose_col},
+    {"free_transpose_row_to_col",  _free_transpose_row_applies,  _free_transpose_row},
+    {"redundant_layout_transform", _redundant_layout_transform_applies, _redundant_layout_transform},
+    {"double_layout_transform",    _double_layout_transform_applies,    _double_layout_transform},
 };
 
 static const int _N_RULES = (int)(sizeof(_RULES) / sizeof(_RULES[0]));

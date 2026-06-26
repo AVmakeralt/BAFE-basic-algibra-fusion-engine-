@@ -14,6 +14,10 @@ bafe_cost_model bafe_cost_model_default(void) {
     m.beta_bytes = 1e-8;         /* 1 ns per byte ~ 1 GB/s */
     m.gamma_intermediate = 1.0;  /* flat 1 cost unit per intermediate */
     m.delta_fuse = 0.3;          /* 30% bonus for fusion */
+    /* Phase 2 layout weights */
+    m.epsilon_layout_conv = 2e-8;/* layout conversion: ~2x cost of a plain read */
+    m.zeta_layout_fuse = 0.2;    /* layout-compatible fusion bonus */
+    m.eta_contiguous = 5e-9;     /* contiguous access saves ~50% of memory cost */
     return m;
 }
 
@@ -99,21 +103,105 @@ double bafe_cost_node(const bafe_cost_model *m, const char *op_name,
                       const bafe_shape *inputs, int n_inputs,
                       const bafe_op_attrs *attrs,
                       const bafe_shape *out_shape, bafe_dtype dtype) {
+    /* backward-compatible: assume ROW_MAJOR everywhere (no layout info) */
+    bafe_layout layouts[BAFE_MAX_CHILDREN];
+    for (int i = 0; i < n_inputs && i < BAFE_MAX_CHILDREN; i++) {
+        layouts[i] = BAFE_LAYOUT_ROW_MAJOR;
+    }
+    return bafe_cost_node_with_layout(m, op_name, inputs, n_inputs, attrs,
+                                       out_shape, dtype,
+                                       layouts, n_inputs, BAFE_LAYOUT_ROW_MAJOR);
+}
+
+double bafe_cost_layout_conversion(const bafe_cost_model *m,
+                                    const char *op_name,
+                                    const bafe_layout *input_layouts, int n_inputs,
+                                    bafe_layout output_layout,
+                                    const bafe_shape *inputs, int n_input_shapes) {
+    (void)output_layout;
+    /* For elementwise binary ops (add/sub/mul): if input layouts differ,
+     * the codegen must convert one of them. Cost = epsilon * bytes_converted.
+     * For matmul: A row-major + B row-major means we transpose B on the fly
+     * (strided access), which is cache-unfriendly. Model this as a conversion.
+     */
+    if (n_inputs < 2) return 0.0;
+    if (strcmp(op_name, "matmul") == 0 || bafe_op_is_fused(op_name)) {
+        /* For matmul-family ops, the "natural" access is A row-major + B col-major.
+         * If both are row-major, B is accessed with stride-N reads (cache-unfriendly).
+         * Model this as a "virtual conversion" of B to col-major.
+         */
+        if (n_inputs >= 2 && input_layouts[0] == BAFE_LAYOUT_ROW_MAJOR
+                          && input_layouts[1] == BAFE_LAYOUT_ROW_MAJOR) {
+            /* cost = epsilon * bytes_of_B */
+            if (n_input_shapes >= 2) {
+                size_t b_bytes = bafe_shape_numel(&inputs[1]) * 4; /* assume f32 */
+                return m->epsilon_layout_conv * (double)b_bytes;
+            }
+        }
+        return 0.0;
+    }
+    /* elementwise: if layouts differ, conversion needed */
+    if (strcmp(op_name, "add") == 0 || strcmp(op_name, "sub") == 0 ||
+        strcmp(op_name, "mul") == 0 || strcmp(op_name, "bias_add") == 0) {
+        bafe_layout l0 = input_layouts[0];
+        for (int i = 1; i < n_inputs; i++) {
+            if (input_layouts[i] != l0) {
+                /* conversion needed: cost = epsilon * bytes_of_smaller_input */
+                if (i < n_input_shapes) {
+                    size_t bytes = bafe_shape_numel(&inputs[i]) * 4; /* assume f32 */
+                    return m->epsilon_layout_conv * (double)bytes;
+                }
+            }
+        }
+    }
+    return 0.0;
+}
+
+double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
+                                   const bafe_shape *inputs, int n_inputs,
+                                   const bafe_op_attrs *attrs,
+                                   const bafe_shape *out_shape, bafe_dtype dtype,
+                                   const bafe_layout *input_layouts, int n_input_layouts,
+                                   bafe_layout output_layout) {
     double flops = bafe_cost_flops(op_name, inputs, n_inputs, attrs, out_shape);
     double bytes = bafe_cost_bytes(op_name, inputs, n_inputs, out_shape, dtype);
     double cost = m->alpha_flops * flops + m->beta_bytes * bytes;
-    /* intermediate penalty: 1 per non-fused op (since they materialize) */
+    /* intermediate penalty */
     if (!bafe_op_is_fused(op_name) &&
         strcmp(op_name, "input") != 0 &&
         strcmp(op_name, "constant") != 0 &&
         strcmp(op_name, "transpose") != 0 &&
         strcmp(op_name, "reshape") != 0 &&
-        strcmp(op_name, "broadcast_to") != 0) {
+        strcmp(op_name, "broadcast_to") != 0 &&
+        strcmp(op_name, "layout_transform") != 0) {
         cost += m->gamma_intermediate;
     }
     /* fusion bonus */
     if (bafe_op_is_fused(op_name)) {
         cost -= m->delta_fuse;
+        /* Phase 2: extra bonus if all inputs share the same layout */
+        if (n_input_layouts >= 2) {
+            bool all_same = true;
+            bafe_layout l0 = input_layouts[0];
+            for (int i = 1; i < n_input_layouts; i++) {
+                if (input_layouts[i] != l0) { all_same = false; break; }
+            }
+            if (all_same && l0 == output_layout) {
+                cost -= m->zeta_layout_fuse;
+            }
+        }
+    }
+    /* Phase 2: layout conversion cost */
+    cost += bafe_cost_layout_conversion(m, op_name, input_layouts, n_input_layouts,
+                                         output_layout, inputs, n_inputs);
+    /* Phase 2: contiguous access bonus for matmul when A is row-major
+     * (the inner loop walks A contiguously, which is cache-friendly). */
+    if ((strcmp(op_name, "matmul") == 0 || bafe_op_is_fused(op_name)) &&
+        n_input_layouts >= 1 && input_layouts[0] == BAFE_LAYOUT_ROW_MAJOR) {
+        if (n_inputs >= 1) {
+            size_t a_bytes = bafe_shape_numel(&inputs[0]) * bafe_dtype_byte_size(dtype);
+            cost -= m->eta_contiguous * (double)a_bytes;
+        }
     }
     return cost;
 }
@@ -124,8 +212,14 @@ double bafe_cost_graph(const bafe_cost_model *m, const bafe_graph *g) {
         const bafe_node *n = &g->nodes[i];
         if (n->is_input || n->is_constant) continue;
         bafe_shape inputs[BAFE_MAX_CHILDREN];
-        for (int j = 0; j < n->n_children; j++) inputs[j] = g->nodes[n->children[j]].shape;
-        total += bafe_cost_node(m, n->op_name, inputs, n->n_children, &n->attrs, &n->shape, n->dtype);
+        bafe_layout input_layouts[BAFE_MAX_CHILDREN];
+        for (int j = 0; j < n->n_children; j++) {
+            inputs[j] = g->nodes[n->children[j]].shape;
+            input_layouts[j] = g->nodes[n->children[j]].layout;
+        }
+        total += bafe_cost_node_with_layout(m, n->op_name, inputs, n->n_children,
+                                              &n->attrs, &n->shape, n->dtype,
+                                              input_layouts, n->n_children, n->layout);
     }
     return total;
 }

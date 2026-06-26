@@ -1,36 +1,11 @@
 """Tests for the rewrite engine: rules and alternatives."""
 import pytest
 import ctypes
-from bafe._binding import _lib, BafeGraph, BafeOpAttrs, make_shape
-
-import ctypes.util
-from ctypes import Structure, c_int, c_int32, c_char_p, c_size_t, POINTER, byref
+from bafe._binding import (
+    _lib, BafeGraph, BafeOpAttrs, BafeAlternative, BafeAltList, make_shape,
+)
 
 BAFE_MAX_CHILDREN = 4
-BAFE_MAX_ALTERNATIVES = 512
-
-
-class BafeAlternative(Structure):
-    _fields_ = [
-        ("original_node_id", c_int32),
-        ("op_name", c_char_p),
-        ("attrs", BafeOpAttrs),
-        ("n_children", c_int),
-        ("children", c_int32 * BAFE_MAX_CHILDREN),
-    ]
-
-
-class BafeAltList(Structure):
-    _fields_ = [
-        ("items", BafeAlternative * BAFE_MAX_ALTERNATIVES),
-        ("n", c_int),
-    ]
-
-
-_lib.bafe_rewrite_find.argtypes = [ctypes.POINTER(BafeGraph), ctypes.POINTER(BafeAltList)]
-_lib.bafe_rewrite_find.restype = c_int
-_lib.bafe_rewrite_default_count.argtypes = []
-_lib.bafe_rewrite_default_count.restype = c_int
 
 
 def make_graph():

@@ -25,6 +25,13 @@ static void _set_attrs_from_va(bafe_op_attrs *attrs, const bafe_op_attrs *src) {
 
 bafe_node_id bafe_graph_add_input(bafe_graph *g, const char *name,
                                    const bafe_shape *shape, bafe_dtype dtype) {
+    return bafe_graph_add_input_with_layout(g, name, shape, dtype, BAFE_LAYOUT_ROW_MAJOR);
+}
+
+bafe_node_id bafe_graph_add_input_with_layout(bafe_graph *g, const char *name,
+                                              const bafe_shape *shape,
+                                              bafe_dtype dtype,
+                                              bafe_layout layout) {
     bafe_node_id id = _new_id(g);
     if (id < 0) return -1;
     bafe_node *n = &g->nodes[id];
@@ -32,6 +39,7 @@ bafe_node_id bafe_graph_add_input(bafe_graph *g, const char *name,
     n->is_input = true;
     n->shape = *shape;
     n->dtype = dtype;
+    n->layout = layout;
     if (name) {
         strncpy(n->input_name, name, BAFE_MAX_ATTR_LEN - 1);
         n->input_name[BAFE_MAX_ATTR_LEN - 1] = '\0';
@@ -43,6 +51,17 @@ bafe_node_id bafe_graph_add_input(bafe_graph *g, const char *name,
     return id;
 }
 
+int bafe_graph_set_node_layout(bafe_graph *g, bafe_node_id id, bafe_layout layout) {
+    if (id < 0 || id >= g->n_nodes) return -1;
+    g->nodes[id].layout = layout;
+    return 0;
+}
+
+bafe_layout bafe_graph_get_node_layout(const bafe_graph *g, bafe_node_id id) {
+    if (id < 0 || id >= g->n_nodes) return BAFE_LAYOUT_ROW_MAJOR;
+    return g->nodes[id].layout;
+}
+
 bafe_node_id bafe_graph_add_constant(bafe_graph *g, double value,
                                       const bafe_shape *shape, bafe_dtype dtype) {
     bafe_node_id id = _new_id(g);
@@ -52,8 +71,45 @@ bafe_node_id bafe_graph_add_constant(bafe_graph *g, double value,
     n->is_constant = true;
     n->shape = *shape;
     n->dtype = dtype;
+    n->layout = BAFE_LAYOUT_ROW_MAJOR;
     n->const_value = value;
     return id;
+}
+
+/* Layout propagation: infer the output layout of an op based on its type
+ * and the layouts of its children.
+ *
+ * Rules (Phase 2 MVP):
+ *   - input/constant: from caller (already set)
+ *   - layout_transform(x): from attrs.name (parsed as a layout string)
+ *   - transpose(x, perm): if rank-2 with perm=(1,0), flip ROW<->COL;
+ *     otherwise inherit x's layout
+ *   - all other ops: inherit from first child
+ */
+static bafe_layout _infer_layout(const char *op_name, const bafe_op_attrs *attrs,
+                                  const bafe_node *children[], int n_children) {
+    if (bafe_op_is_layout_transform(op_name)) {
+        /* parse attrs.name as a layout string */
+        if (attrs && attrs->name[0]) {
+            if (strcmp(attrs->name, "row") == 0) return BAFE_LAYOUT_ROW_MAJOR;
+            if (strcmp(attrs->name, "col") == 0) return BAFE_LAYOUT_COL_MAJOR;
+            if (strcmp(attrs->name, "blocked") == 0) return BAFE_LAYOUT_BLOCKED;
+            if (strcmp(attrs->name, "tc") == 0) return BAFE_LAYOUT_TENSOR_CORE;
+        }
+        return BAFE_LAYOUT_ROW_MAJOR;
+    }
+    if (strcmp(op_name, "transpose") == 0 && n_children == 1 && children[0]) {
+        /* for rank-2 transpose with perm=(1,0), flip the layout */
+        const bafe_node *x = children[0];
+        if (x->shape.rank == 2 && attrs && attrs->n_perm == 2 &&
+            attrs->perm[0] == 1 && attrs->perm[1] == 0) {
+            if (x->layout == BAFE_LAYOUT_ROW_MAJOR) return BAFE_LAYOUT_COL_MAJOR;
+            if (x->layout == BAFE_LAYOUT_COL_MAJOR) return BAFE_LAYOUT_ROW_MAJOR;
+        }
+        return x->layout;
+    }
+    if (n_children > 0 && children[0]) return children[0]->layout;
+    return BAFE_LAYOUT_ROW_MAJOR;
 }
 
 bafe_node_id bafe_graph_add(bafe_graph *g, const char *op_name,
@@ -75,10 +131,16 @@ bafe_node_id bafe_graph_add(bafe_graph *g, const char *op_name,
     _set_attrs_from_va(&n->attrs, attrs);
     /* infer shape */
     bafe_shape child_shapes[BAFE_MAX_CHILDREN];
-    for (int i = 0; i < n_children; i++) child_shapes[i] = g->nodes[children[i]].shape;
+    const bafe_node *child_nodes[BAFE_MAX_CHILDREN];
+    for (int i = 0; i < n_children; i++) {
+        child_shapes[i] = g->nodes[children[i]].shape;
+        child_nodes[i] = &g->nodes[children[i]];
+    }
     n->shape = op->shape_fn(child_shapes, n_children, &n->attrs);
     /* dtype: take from first child */
     if (n_children > 0) n->dtype = g->nodes[children[0]].dtype;
+    /* layout: propagate from children */
+    n->layout = _infer_layout(op_name, &n->attrs, child_nodes, n_children);
     return id;
 }
 
