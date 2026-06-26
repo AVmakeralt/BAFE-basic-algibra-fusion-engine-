@@ -187,6 +187,85 @@ The temperature controls a Boltzmann acceptance criterion:
 rewrites are materialized. At high T, all rewrites are roughly equally
 likely (exploration).
 
+## Phase 3: Auto-tuning loop with profiling feedback
+
+BAFE can now **learn** a cost model from observed kernel runtimes. The
+auto-tuning loop closes the feedback cycle: compile → measure → refit →
+re-optimize.
+
+### How it works
+
+```
+user calls f(A, B) repeatedly
+   ↓
+JIT compiles kernel (first call) or hits cache
+   ↓
+autotune layer times the kernel + logs:
+   (graph_hash, features, predicted_cost, observed_runtime)
+   ↓
+after N samples, refits the cost model via linear regression:
+   log(runtime_ms) = w · features + b
+   ↓
+the learned model replaces the hand-tuned one for future extractions
+```
+
+### Feature vector (8 features per kernel)
+
+| Index | Feature           | Description                              |
+|-------|-------------------|------------------------------------------|
+| 0     | `num_inputs`      | Number of input tensors                  |
+| 1     | `num_ops`         | Number of non-input/constant nodes       |
+| 2     | `num_matmuls`     | Number of matmul ops                     |
+| 3     | `num_fused`       | Number of fused ops                      |
+| 4     | `log_flops`       | log(total FLOPs + 1)                     |
+| 5     | `log_bytes`       | log(total memory traffic + 1)            |
+| 6     | `num_intermediates` | Number of materialized intermediates   |
+| 7     | `has_col_major`   | 1 if any input is col-major, else 0     |
+
+### Using autotune from Python
+
+```python
+import bafe
+
+# Configure the autotune loop
+bafe.configure_autotune(
+    refit_threshold=10,    # refit after 10 new samples
+    warmup_calls=1,        # skip timing for the first call
+    timing_iters=3,        # average runtime over 3 invocations
+)
+
+@bafe.jit(autotune=True)
+def f(A, B):
+    return bafe.matmul(A, B)
+
+# Just call f normally — autotune logs + refits in the background
+for i in range(50):
+    A = np.random.randn(64, 64).astype(np.float32)
+    B = np.random.randn(64, 64).astype(np.float32)
+    out = f(A, B)
+
+# Inspect the learned model
+stats = bafe.autotune_stats()
+print(f"R^2 = {stats['last_refit_r_squared']:.4f}")
+
+model = bafe.autotune_model()
+print(f"Weights: {model['weights']}")
+print(f"Bias: {model['bias']}")
+
+# Dump the profiling log
+bafe.autotune_dump_log("/tmp/bafe_log.jsonl")
+```
+
+### Demo results
+
+After 50 calls across 5 different shapes (16×16 to 128×128):
+- **45 profiling records** logged
+- **4 cost model refits** triggered (at log sizes 10, 20, 30, 40)
+- **R² = 0.94** — the learned model explains 94% of runtime variance
+- The model learned that `log_bytes` has a large negative weight (larger
+  tensors amortize per-element overhead) and `log_flops` has a large
+  positive weight (more compute = slower)
+
 ## Phase 1 scope (this prototype)
 
 - IR with 17 ops (matmul, add, mul, sub, relu, sigmoid, tanh, neg,

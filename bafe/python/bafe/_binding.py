@@ -204,6 +204,89 @@ _lib.bafe_optimize_and_compile_with_budget.argtypes = [POINTER(BafeGraph),
 _lib.bafe_optimize_and_compile_with_budget.restype = c_void_p
 
 
+# Phase 3 (issue #6): auto-tuning + profiling
+BAFE_NUM_FEATURES = 8
+BAFE_PROFILING_LOG_SIZE = 4096
+
+
+class BafeProfilingRecord(Structure):
+    _fields_ = [
+        ("graph_hash", c_char * 65),
+        ("features", c_double * BAFE_NUM_FEATURES),
+        ("predicted_cost", c_double),
+        ("observed_ms", c_double),
+        ("kernel_id", c_int),
+    ]
+
+
+class BafeProfilingLog(Structure):
+    _fields_ = [
+        ("records", BafeProfilingRecord * BAFE_PROFILING_LOG_SIZE),
+        ("n", c_int),
+        ("head", c_int),
+        ("wrapped", c_bool),
+    ]
+
+
+class BafeLearnedCostModel(Structure):
+    _fields_ = [
+        ("weights", c_double * BAFE_NUM_FEATURES),
+        ("bias", c_double),
+        ("r_squared", c_double),
+        ("n_samples", c_int),
+        ("valid", c_bool),
+    ]
+
+
+class BafeAutotuneConfig(Structure):
+    _fields_ = [
+        ("enabled", c_bool),
+        ("refit_threshold", c_int),
+        ("invalidation_drift", c_double),
+        ("warmup_calls", c_int),
+        ("timing_iters", c_int),
+    ]
+
+
+class BafeAutotuneStats(Structure):
+    _fields_ = [
+        ("total_calls", c_int),
+        ("total_compiles", c_int),
+        ("total_refits", c_int),
+        ("total_invalidations", c_int),
+        ("last_refit_r_squared", c_double),
+        ("log_size", c_int),
+    ]
+
+
+_lib.bafe_profiling_init.argtypes = []
+_lib.bafe_profiling_init.restype = None
+_lib.bafe_profiling_reset.argtypes = []
+_lib.bafe_profiling_reset.restype = None
+_lib.bafe_profiling_extract_features.argtypes = [POINTER(BafeGraph), POINTER(c_double)]
+_lib.bafe_profiling_extract_features.restype = None
+_lib.bafe_profiling_add.argtypes = [c_char_p, POINTER(c_double), c_double, c_double, c_int]
+_lib.bafe_profiling_add.restype = None
+_lib.bafe_profiling_get_log.argtypes = []
+_lib.bafe_profiling_get_log.restype = POINTER(BafeProfilingLog)
+_lib.bafe_profiling_dump_jsonl.argtypes = [c_char_p]
+_lib.bafe_profiling_dump_jsonl.restype = c_int
+_lib.bafe_profiling_refit.argtypes = []
+_lib.bafe_profiling_refit.restype = c_int
+_lib.bafe_profiling_get_model.argtypes = []
+_lib.bafe_profiling_get_model.restype = POINTER(BafeLearnedCostModel)
+_lib.bafe_profiling_predict_ms.argtypes = [POINTER(c_double)]
+_lib.bafe_profiling_predict_ms.restype = c_double
+_lib.bafe_autotune_config_default.argtypes = []
+_lib.bafe_autotune_config_default.restype = BafeAutotuneConfig
+_lib.bafe_autotune_configure.argtypes = [POINTER(BafeAutotuneConfig)]
+_lib.bafe_autotune_configure.restype = None
+_lib.bafe_autotune_get_config.argtypes = []
+_lib.bafe_autotune_get_config.restype = BafeAutotuneConfig
+_lib.bafe_autotune_get_stats.argtypes = []
+_lib.bafe_autotune_get_stats.restype = BafeAutotuneStats
+
+
 # types
 _lib.bafe_dtype_c_name.argtypes = [c_int]
 _lib.bafe_dtype_c_name.restype = c_char_p

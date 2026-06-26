@@ -311,10 +311,12 @@ class JittedFunction:
     multi-pass search to discover deeper rewrites.
     """
 
-    def __init__(self, fn: Callable, budget=None):
+    def __init__(self, fn: Callable, budget=None, autotune=False):
         self._fn = fn
         self._budget = budget  # BafeSearchBudget or None (deterministic)
-        self._compiled = {}  # key: (shapes, dtypes, layouts) -> (fn_ptr, sig, out_shape, out_dtype)
+        self._autotune = autotune  # Phase 3: enable autotune loop
+        self._compiled = {}  # key: (shapes, dtypes, layouts) -> compiled tuple
+        self._call_count = {}  # key -> call number (for warmup tracking)
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args: np.ndarray) -> np.ndarray:
@@ -335,8 +337,15 @@ class JittedFunction:
 
         if key not in self._compiled:
             self._compiled[key] = self._compile(args)
+            # Phase 3 (issue #6): if autotune is enabled and this is a new
+            # compile, increment the compile counter
+            if self._autotune_enabled():
+                stats = _lib.bafe_autotune_get_stats()
+                # we can't easily mutate the C stats from here, but the C
+                # side tracks compiles via bafe_jit_get_or_compile
+                pass
 
-        fn_ptr, sig, in_dtypes, out_shape, out_dtype = self._compiled[key]
+        fn_ptr, sig, in_dtypes, out_shape, out_dtype, opt_graph, graph_hash, predicted_cost = self._compiled[key]
 
         # allocate output
         out = np.zeros(out_shape, dtype=out_dtype)
@@ -359,8 +368,59 @@ class JittedFunction:
 
         # call: sig(fn_ptr) creates the callable; then pass the c_args
         kernel = sig(fn_ptr)
-        kernel(*c_args)
+
+        # Phase 3 (issue #6): if autotune is enabled, time the kernel + log
+        if self._autotune_enabled():
+            import time
+            config = _lib.bafe_autotune_get_config()
+            stats = _lib.bafe_autotune_get_stats()
+            # warmup: skip timing for the first N calls
+            # (stats.total_calls is incremented on the C side, but since
+            # we're driving the loop from Python, we track it here)
+            call_num = self._call_count.get(key, 0) + 1
+            self._call_count[key] = call_num
+
+            if call_num <= config.warmup_calls:
+                kernel(*c_args)
+            else:
+                # time over multiple iterations
+                iters = config.timing_iters if config.timing_iters > 0 else 1
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    kernel(*c_args)
+                t1 = time.perf_counter()
+                observed_ms = (t1 - t0) * 1000.0 / iters
+
+                # extract features + log
+                features = (ctypes.c_double * 8)()
+                _lib.bafe_profiling_extract_features(
+                    ctypes.byref(opt_graph), features
+                )
+                _lib.bafe_profiling_add(
+                    graph_hash.encode("utf-8") if isinstance(graph_hash, str) else graph_hash,
+                    features,
+                    ctypes.c_double(predicted_cost),
+                    ctypes.c_double(observed_ms),
+                    ctypes.c_int(0),
+                )
+
+                # check if we should refit
+                # (the C side tracks samples_since_refit; we trigger refit
+                # when the log grows by refit_threshold since last refit)
+                log = _lib.bafe_profiling_get_log().contents
+                if log.n > 0 and log.n % config.refit_threshold == 0:
+                    _lib.bafe_profiling_refit()
+                    # after refit, check if predictions drifted enough to
+                    # invalidate the cache. For now, we just log the refit;
+                    # full invalidation is a future enhancement.
+        else:
+            kernel(*c_args)
+
         return out
+
+    def _autotune_enabled(self) -> bool:
+        """Check if autotune is enabled for this function."""
+        return getattr(self, "_autotune", False)
 
     def _compile(self, args: Tuple[np.ndarray, ...]):
         global _TRACE
@@ -443,14 +503,30 @@ class JittedFunction:
         out_shape = tuple(out_node.shape.dims[i] for i in range(out_node.shape.rank))
         out_np_dt = _BAFE_TO_NP[out_node.dtype]
 
-        return (fn_ptr, sig, in_dtypes, out_shape, out_np_dt)
+        # Phase 3 (issue #6): compute graph hash + predicted cost for autotune logging
+        graph_hash_buf = ctypes.create_string_buffer(65)
+        _lib.bafe_jit_hash_graph(ctypes.byref(optimized), graph_hash_buf, ctypes.c_size_t(65))
+        graph_hash = graph_hash_buf.value.decode("utf-8")
+
+        # predicted cost = total graph cost from the cost model
+        cm = _lib.bafe_cost_model_default()
+        predicted_cost = _lib.bafe_cost_graph(ctypes.byref(cm), ctypes.byref(optimized))
+
+        # keep a copy of the optimized graph for feature extraction during autotune
+        # (we store it as a ctypes object so it doesn't get GC'd)
+        opt_graph_copy = BafeGraph()
+        ctypes.memmove(ctypes.byref(opt_graph_copy), ctypes.byref(optimized), ctypes.sizeof(BafeGraph))
+
+        return (fn_ptr, sig, in_dtypes, out_shape, out_np_dt,
+                opt_graph_copy, graph_hash, predicted_cost)
 
 
 def jit(fn: Callable = None, *, budget=None, iters: int = None,
-        temperature: float = None, seed: int = None):
+        temperature: float = None, seed: int = None, autotune: bool = False):
     """Decorator: trace + optimize + JIT-compile a tensor function.
 
     Phase 2 (issue #1): optional stochastic search parameters.
+    Phase 3 (issue #6): optional autotune loop.
 
     Args:
         budget: a BafeSearchBudget for full control. If None and no other
@@ -458,6 +534,9 @@ def jit(fn: Callable = None, *, budget=None, iters: int = None,
         iters: number of stochastic passes (default 4 if budget mode on).
         temperature: 0.0 = greedy, high = explore randomly (default 1.0).
         seed: PRNG seed for reproducibility (default 0xBAFE5EED).
+        autotune: if True, enable the auto-tuning loop. Each call is timed,
+                  logged, and after enough samples the cost model is refit
+                  via linear regression on observed runtimes.
 
     Examples:
         @bafe.jit
@@ -466,14 +545,20 @@ def jit(fn: Callable = None, *, budget=None, iters: int = None,
         @bafe.jit(iters=8, temperature=2.0)
         def f(A, B): ...                      # stochastic, 8 passes
 
-        budget = bafe.SearchBudget(iters=16, max_nodes=500, seed=42)
-        @bafe.jit(budget=budget)
-        def f(A, B): ...                      # full custom budget
+        @bafe.jit(autotune=True)
+        def f(A, B): ...                      # autotune enabled
+
+        @bafe.jit(autotune=True, iters=4)
+        def f(A, B): ...                      # stochastic + autotune
+
+        budget = bafe.make_search_budget(iters=16, max_nodes=500, seed=42)
+        @bafe.jit(budget=budget, autotune=True)
+        def f(A, B): ...                      # full custom budget + autotune
     """
     # Support both @bafe.jit and @bafe.jit(...) usage
     if fn is not None:
         # called as @bafe.jit (no parentheses)
-        return JittedFunction(fn)
+        return JittedFunction(fn, autotune=autotune)
 
     def deco(fn):
         b = budget
@@ -484,7 +569,7 @@ def jit(fn: Callable = None, *, budget=None, iters: int = None,
                 temperature=temperature if temperature is not None else 1.0,
                 seed=seed if seed is not None else 0xBAFE5EED,
             )
-        return JittedFunction(fn, budget=b)
+        return JittedFunction(fn, budget=b, autotune=autotune)
     return deco
 
 
@@ -528,10 +613,90 @@ def optimize(graph: BafeGraph) -> BafeGraph:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 (issue #6): autotune API
+# ---------------------------------------------------------------------------
+
+def configure_autotune(refit_threshold: int = 20,
+                       invalidation_drift: float = 0.25,
+                       warmup_calls: int = 2,
+                       timing_iters: int = 5):
+    """Configure the global autotune settings.
+
+    Args:
+        refit_threshold: refit the cost model after this many new samples.
+        invalidation_drift: invalidate cached kernels when predictions
+                           drift by more than this ratio (0.25 = 25%).
+        warmup_calls: skip timing for the first N calls (cache effects).
+        timing_iters: average the kernel runtime over this many invocations.
+    """
+    cfg = _lib.bafe_autotune_config_default()
+    cfg.enabled = True
+    cfg.refit_threshold = int(refit_threshold)
+    cfg.invalidation_drift = float(invalidation_drift)
+    cfg.warmup_calls = int(warmup_calls)
+    cfg.timing_iters = int(timing_iters)
+    _lib.bafe_autotune_configure(ctypes.byref(cfg))
+
+
+def autotune_stats() -> dict:
+    """Get current autotune statistics.
+
+    Returns a dict with:
+        total_calls, total_compiles, total_refits, total_invalidations,
+        last_refit_r_squared, log_size
+    """
+    s = _lib.bafe_autotune_get_stats()
+    return {
+        "total_calls": s.total_calls,
+        "total_compiles": s.total_compiles,
+        "total_refits": s.total_refits,
+        "total_invalidations": s.total_invalidations,
+        "last_refit_r_squared": s.last_refit_r_squared,
+        "log_size": s.log_size,
+    }
+
+
+def autotune_refit() -> int:
+    """Manually trigger a cost model refit.
+
+    Returns 0 on success, non-zero if not enough samples.
+    """
+    return _lib.bafe_profiling_refit()
+
+
+def autotune_model() -> dict:
+    """Get the current learned cost model.
+
+    Returns a dict with:
+        weights (list of 8 floats), bias, r_squared, n_samples, valid
+    """
+    m = _lib.bafe_profiling_get_model().contents
+    return {
+        "weights": [m.weights[i] for i in range(8)],
+        "bias": m.bias,
+        "r_squared": m.r_squared,
+        "n_samples": m.n_samples,
+        "valid": bool(m.valid),
+    }
+
+
+def autotune_dump_log(path: str) -> int:
+    """Dump the profiling log to a JSONL file. Returns number of records."""
+    return _lib.bafe_profiling_dump_jsonl(path.encode("utf-8"))
+
+
+def autotune_reset():
+    """Reset all profiling state (log, learned model, stats)."""
+    _lib.bafe_profiling_reset()
+
+
 __all__ = [
     "Tensor", "jit", "optimize", "make_search_budget",
     "input", "matmul", "add", "sub", "mul", "relu", "sigmoid", "tanh",
     "bias_add", "transpose", "reduce_sum", "reduce_max", "reshape", "broadcast_to",
     "graph_summary",
+    "configure_autotune", "autotune_stats", "autotune_refit",
+    "autotune_model", "autotune_dump_log", "autotune_reset",
     "__version__",
 ]
