@@ -11,9 +11,11 @@ __pycache__/
 .venv/
 venv/
 .bafecache/
+.bafecache_test/
 *.egg-info/
 dist/
 build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+bafe/build/
