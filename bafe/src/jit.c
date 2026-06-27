@@ -264,10 +264,20 @@ bafe_kernel_fn bafe_jit_get_or_compile(const bafe_graph *g,
         fclose(f);
         free(src);
 
-        /* compile: cc -shared -fPIC -O2 -o <so> <c> -lm */
+        /* compile with aggressive optimization:
+         * -O3: maximum optimization level
+         * -march=native: use all available CPU instructions (AVX, SSE4, etc.)
+         * -ftree-vectorize: auto-vectorize loops
+         * -funroll-loops: unroll loops for better instruction pipelining
+         * -fno-math-errno: faster math (no errno checking)
+         * -ffast-math: allow algebraic FP optimizations (may change results slightly)
+         *   (disabled by default — can be enabled via env var BAFE_FAST_MATH=1) */
+        const char *fast_math = getenv("BAFE_FAST_MATH") ? "-ffast-math" : "-fno-math-errno";
         char cmd[2048];
-        snprintf(cmd, sizeof(cmd), "cc -shared -fPIC -O2 -std=c11 -o %s %s -lm 2>&1",
-                 so_path, c_path);
+        snprintf(cmd, sizeof(cmd),
+                 "cc -shared -fPIC -O3 -march=native -std=c11 "
+                 "-ftree-vectorize -funroll-loops %s -o %s %s -lm 2>&1",
+                 fast_math, so_path, c_path);
         FILE *pipe = popen(cmd, "r");
         if (!pipe) {
             if (err_buf) snprintf(err_buf, err_buf_size, "popen failed");

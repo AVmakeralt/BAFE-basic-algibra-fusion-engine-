@@ -147,6 +147,15 @@ class BafeCostModel(Structure):
         ("epsilon_layout_conv", c_double),
         ("zeta_layout_fuse", c_double),
         ("eta_contiguous", c_double),
+        ("l1_threshold", c_double),
+        ("l2_threshold", c_double),
+        ("l3_threshold", c_double),
+        ("l1_bw_weight", c_double),
+        ("l2_bw_weight", c_double),
+        ("l3_bw_weight", c_double),
+        ("dram_bw_weight", c_double),
+        ("simd_bonus", c_double),
+        ("simd_width", c_int),
     ]
 
 
@@ -182,6 +191,7 @@ class BafeSearchBudget(Structure):
         ("temperature", c_double),
         ("seed", c_uint32),
         ("enable_multi_pass", c_bool),
+        ("deep_search", c_bool),
     ]
 
 
@@ -197,6 +207,8 @@ class BafeSearchStats(Structure):
 
 _lib.bafe_search_budget_default.argtypes = []
 _lib.bafe_search_budget_default.restype = BafeSearchBudget
+_lib.bafe_search_budget_deep.argtypes = []
+_lib.bafe_search_budget_deep.restype = BafeSearchBudget
 _lib.bafe_rewrite_stochastic.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList),
                                           POINTER(BafeSearchBudget)]
 _lib.bafe_rewrite_stochastic.restype = c_int

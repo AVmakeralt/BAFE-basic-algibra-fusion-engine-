@@ -1,8 +1,16 @@
-/* bafe/cost.c - cost model implementation
+/* bafe/cost.c - roofline-based cost model implementation
  *
- * Numbers here are deliberately simple and concrete (not tuned to any
- * specific hardware). Phase 2 will replace these with hardware-aware
- * estimates.
+ * The cost of a node is:
+ *
+ *   cost = max(flops / peak_flops, bytes / effective_bandwidth)
+ *        + gamma_intermediate        (if materialized)
+ *        - delta_fuse                (if fused)
+ *        + layout_conversion_cost
+ *        - contiguous_access_bonus
+ *        - simd_vectorization_bonus
+ *
+ * The effective_bandwidth depends on which cache level the working set
+ * fits in (L1 > L2 > L3 > DRAM).
  */
 #include "bafe/cost.h"
 #include "bafe/ops.h"
@@ -10,78 +18,152 @@
 #include <string.h>
 #include <math.h>
 
-bafe_cost_model bafe_cost_model_default(void) {
+/* ------------------------------------------------------------------ */
+/* Hardware models                                                     */
+/* ------------------------------------------------------------------ */
+
+bafe_hardware_model bafe_hardware_model_default(void) {
+    bafe_hardware_model h;
+    /* Modern x86-64 desktop (Skylake-class, AVX2) */
+    h.peak_gflops = 64.0;       /* 8 doubles * 2 (FMA) * 4 GHz = ~64 GFLOPS */
+    h.clock_ghz = 4.0;
+    h.simd_width = 8;           /* AVX2: 8 F32 lanes */
+    h.l1_cache_size = 32768;    /* 32 KB */
+    h.l2_cache_size = 262144;   /* 256 KB */
+    h.l3_cache_size = 8388608;  /* 8 MB */
+    h.l1_bandwidth_gbs = 1000.0;
+    h.l2_bandwidth_gbs = 500.0;
+    h.l3_bandwidth_gbs = 200.0;
+    h.dram_bandwidth_gbs = 50.0;
+    h.f32_flop_rate = 1.0;
+    h.f64_flop_rate = 0.5;
+    h.f16_flop_rate = 2.0;
+    h.bf16_flop_rate = 2.0;
+    h.i32_flop_rate = 1.0;
+    h.i64_flop_rate = 0.5;
+    return h;
+}
+
+bafe_hardware_model bafe_hardware_model_server(void) {
+    bafe_hardware_model h;
+    /* High-end server CPU (Ice Lake, AVX-512) */
+    h.peak_gflops = 128.0;      /* 16 F32 * 2 (FMA) * 4 GHz */
+    h.clock_ghz = 4.0;
+    h.simd_width = 16;          /* AVX-512: 16 F32 lanes */
+    h.l1_cache_size = 49152;    /* 48 KB */
+    h.l2_cache_size = 1048576;  /* 1 MB */
+    h.l3_cache_size = 33554432; /* 32 MB */
+    h.l1_bandwidth_gbs = 2000.0;
+    h.l2_bandwidth_gbs = 800.0;
+    h.l3_bandwidth_gbs = 300.0;
+    h.dram_bandwidth_gbs = 100.0;
+    h.f32_flop_rate = 1.0;
+    h.f64_flop_rate = 0.5;
+    h.f16_flop_rate = 2.0;
+    h.bf16_flop_rate = 2.0;     /* AMX gives higher but we're conservative */
+    h.i32_flop_rate = 1.0;
+    h.i64_flop_rate = 0.5;
+    return h;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cost model from hardware                                            */
+/* ------------------------------------------------------------------ */
+
+bafe_cost_model bafe_cost_model_from_hardware(const bafe_hardware_model *hw) {
     bafe_cost_model m;
-    m.alpha_flops = 1e-9;        /* 1 ns per FLOP ~ 1 GFLOP/s */
-    m.beta_bytes = 1e-8;         /* 1 ns per byte ~ 1 GB/s */
-    m.gamma_intermediate = 1.0;  /* flat 1 cost unit per intermediate */
-    m.delta_fuse = 0.3;          /* 30% bonus for fusion */
-    /* Phase 2 layout weights */
-    m.epsilon_layout_conv = 2e-8;/* layout conversion: ~2x cost of a plain read */
-    m.zeta_layout_fuse = 0.2;    /* layout-compatible fusion bonus */
-    m.eta_contiguous = 5e-9;     /* contiguous access saves ~50% of memory cost */
+    if (!hw) hw = &(bafe_hardware_model){0}; /* fallback — but we always pass non-null */
+
+    /* Roofline: alpha = 1 / peak_flops, beta = 1 / peak_bandwidth */
+    double peak_flops_per_sec = hw->peak_gflops * 1e9;
+    double peak_bytes_per_sec = hw->dram_bandwidth_gbs * 1e9;
+
+    m.alpha_flops = 1.0 / peak_flops_per_sec;     /* cost per FLOP */
+    m.beta_bytes = 1.0 / peak_bytes_per_sec;       /* cost per byte (DRAM baseline) */
+    m.gamma_intermediate = 1.0;
+    m.delta_fuse = 0.3;
+
+    /* Layout weights */
+    m.epsilon_layout_conv = 2.0 / peak_bytes_per_sec;  /* layout conv = 2x read */
+    m.zeta_layout_fuse = 0.2;
+    m.eta_contiguous = 0.5 / peak_bytes_per_sec;       /* contiguous = 50% bandwidth bonus */
+
+    /* Cache hierarchy thresholds (in bytes) */
+    m.l1_threshold = (double)hw->l1_cache_size;
+    m.l2_threshold = (double)hw->l2_cache_size;
+    m.l3_threshold = (double)hw->l3_cache_size;
+
+    /* Bandwidth weights: higher = faster (lower cost per byte) */
+    m.l1_bw_weight = hw->l1_bandwidth_gbs / hw->dram_bandwidth_gbs;   /* ~20x */
+    m.l2_bw_weight = hw->l2_bandwidth_gbs / hw->dram_bandwidth_gbs;   /* ~10x */
+    m.l3_bw_weight = hw->l3_bandwidth_gbs / hw->dram_bandwidth_gbs;   /* ~4x */
+    m.dram_bw_weight = 1.0;
+
+    /* SIMD: bonus per element when the op is vectorizable */
+    m.simd_bonus = 0.1 / hw->simd_width;  /* each SIMD lane saves ~10% of scalar cost */
+    m.simd_width = hw->simd_width;
+
     return m;
 }
+
+bafe_cost_model bafe_cost_model_default(void) {
+    bafe_hardware_model hw = bafe_hardware_model_default();
+    return bafe_cost_model_from_hardware(&hw);
+}
+
+/* ------------------------------------------------------------------ */
+/* FLOPs estimation                                                    */
+/* ------------------------------------------------------------------ */
 
 double bafe_cost_flops(const char *op_name, const bafe_shape *inputs, int n_inputs,
                        const bafe_op_attrs *attrs, const bafe_shape *out_shape) {
     (void)attrs;
     if (strcmp(op_name, "matmul") == 0 && n_inputs == 2) {
-        /* M*N*K MACs = 2*M*N*K FLOPs */
         int32_t M = inputs[0].dims[inputs[0].rank - 2];
         int32_t K = inputs[0].dims[inputs[0].rank - 1];
         int32_t N = inputs[1].dims[inputs[1].rank - 2];
-        return 2.0 * (double)M * (double)N * (double)K;
+        /* batch FLOPs */
+        int32_t batch = 1;
+        for (int i = 0; i < inputs[0].rank - 2; i++) batch *= inputs[0].dims[i];
+        return 2.0 * (double)M * (double)N * (double)K * (double)batch;
     }
     if (strcmp(op_name, "fused_matmul_relu") == 0 && n_inputs == 2) {
-        int32_t M = inputs[0].dims[inputs[0].rank - 2];
-        int32_t K = inputs[0].dims[inputs[0].rank - 1];
-        int32_t N = inputs[1].dims[inputs[1].rank - 2];
-        return 2.0 * (double)M * (double)N * (double)K;
+        return bafe_cost_flops("matmul", inputs, n_inputs, attrs, out_shape);
     }
     if (strcmp(op_name, "fused_matmul_bias") == 0 && n_inputs == 3) {
-        int32_t M = inputs[0].dims[inputs[0].rank - 2];
-        int32_t K = inputs[0].dims[inputs[0].rank - 1];
-        int32_t N = inputs[1].dims[inputs[1].rank - 2];
-        return 2.0 * (double)M * (double)N * (double)K + (double)M * (double)N;
+        double mm_flops = bafe_cost_flops("matmul", inputs, 2, attrs, out_shape);
+        return mm_flops + (double)bafe_shape_numel(out_shape);
     }
     if (strcmp(op_name, "fused_matmul_bias_relu") == 0 && n_inputs == 3) {
-        int32_t M = inputs[0].dims[inputs[0].rank - 2];
-        int32_t K = inputs[0].dims[inputs[0].rank - 1];
-        int32_t N = inputs[1].dims[inputs[1].rank - 2];
-        return 2.0 * (double)M * (double)N * (double)K + (double)M * (double)N;
+        double mm_flops = bafe_cost_flops("matmul", inputs, 2, attrs, out_shape);
+        return mm_flops + (double)bafe_shape_numel(out_shape);
     }
-    /* elementwise: 1 FLOP per output element */
     size_t out_n = bafe_shape_numel(out_shape);
     if (strcmp(op_name, "add") == 0 || strcmp(op_name, "sub") == 0 ||
         strcmp(op_name, "mul") == 0 || strcmp(op_name, "neg") == 0) {
         return (double)out_n;
     }
-    if (strcmp(op_name, "relu") == 0 || strcmp(op_name, "sigmoid") == 0 ||
-        strcmp(op_name, "tanh") == 0) {
-        /* sigmoid/tanh are more expensive but we count as ~4 FLOPs/elem */
-        if (strcmp(op_name, "sigmoid") == 0 || strcmp(op_name, "tanh") == 0) {
-            return 4.0 * (double)out_n;
-        }
+    if (strcmp(op_name, "relu") == 0) return (double)out_n;
+    if (strcmp(op_name, "sigmoid") == 0 || strcmp(op_name, "tanh") == 0) {
+        return 4.0 * (double)out_n;  /* transcendental = ~4 FLOPs */
+    }
+    if (strcmp(op_name, "bias_add") == 0 || strcmp(op_name, "scale") == 0) {
         return (double)out_n;
     }
-    if (strcmp(op_name, "bias_add") == 0) return (double)out_n;
-    if (strcmp(op_name, "scale") == 0) return (double)out_n;
-    if (strcmp(op_name, "transpose") == 0) return 0.0;  /* just a copy */
-    if (strcmp(op_name, "reshape") == 0) return 0.0;
-    if (strcmp(op_name, "broadcast_to") == 0) return 0.0;
-    if (strcmp(op_name, "reduce_sum") == 0) {
-        /* read input, write output */
-        size_t in_n = bafe_shape_numel(&inputs[0]);
-        return (double)in_n;
+    if (strcmp(op_name, "transpose") == 0 || strcmp(op_name, "reshape") == 0 ||
+        strcmp(op_name, "broadcast_to") == 0 || strcmp(op_name, "layout_transform") == 0) {
+        return 0.0;
     }
-    if (strcmp(op_name, "reduce_max") == 0) {
-        size_t in_n = bafe_shape_numel(&inputs[0]);
-        return (double)in_n;
+    if (strcmp(op_name, "reduce_sum") == 0 || strcmp(op_name, "reduce_max") == 0) {
+        return (double)bafe_shape_numel(&inputs[0]);
     }
     if (strcmp(op_name, "fused_bias_relu") == 0) return 2.0 * (double)out_n;
     return 0.0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Memory traffic estimation                                           */
+/* ------------------------------------------------------------------ */
 
 double bafe_cost_bytes(const char *op_name, const bafe_shape *inputs, int n_inputs,
                        const bafe_shape *out_shape, bafe_dtype dtype) {
@@ -91,29 +173,56 @@ double bafe_cost_bytes(const char *op_name, const bafe_shape *inputs, int n_inpu
         read_bytes += (double)bafe_shape_numel(&inputs[i]) * (double)elem_size;
     }
     double write_bytes = (double)bafe_shape_numel(out_shape) * (double)elem_size;
-    /* fused ops don't write the intermediate */
-    if (bafe_op_is_fused(op_name)) {
-        /* for fused ops we already accounted for the right number of reads
-         * (the inputs of the fused op) and a single write. No bonus here,
-         * but we save an intermediate write that the unfused version would
-         * have done. That's accounted in bafe_cost_node via delta_fuse. */
-    }
     return read_bytes + write_bytes;
 }
 
-double bafe_cost_node(const bafe_cost_model *m, const char *op_name,
-                      const bafe_shape *inputs, int n_inputs,
-                      const bafe_op_attrs *attrs,
-                      const bafe_shape *out_shape, bafe_dtype dtype) {
-    /* backward-compatible: assume ROW_MAJOR everywhere (no layout info) */
-    bafe_layout layouts[BAFE_MAX_CHILDREN];
-    for (int i = 0; i < n_inputs && i < BAFE_MAX_CHILDREN; i++) {
-        layouts[i] = BAFE_LAYOUT_ROW_MAJOR;
-    }
-    return bafe_cost_node_with_layout(m, op_name, inputs, n_inputs, attrs,
-                                       out_shape, dtype,
-                                       layouts, n_inputs, BAFE_LAYOUT_ROW_MAJOR);
+/* ------------------------------------------------------------------ */
+/* Arithmetic intensity + cache level                                  */
+/* ------------------------------------------------------------------ */
+
+double bafe_cost_arithmetic_intensity(const char *op_name,
+                                       const bafe_shape *inputs, int n_inputs,
+                                       const bafe_op_attrs *attrs,
+                                       const bafe_shape *out_shape, bafe_dtype dtype) {
+    double flops = bafe_cost_flops(op_name, inputs, n_inputs, attrs, out_shape);
+    double bytes = bafe_cost_bytes(op_name, inputs, n_inputs, out_shape, dtype);
+    if (bytes < 1.0) return 0.0;
+    return flops / bytes;
 }
+
+int bafe_cost_cache_level(size_t working_set_bytes, const bafe_cost_model *m) {
+    if ((double)working_set_bytes <= m->l1_threshold) return 0;  /* L1 */
+    if ((double)working_set_bytes <= m->l2_threshold) return 1;  /* L2 */
+    if ((double)working_set_bytes <= m->l3_threshold) return 2;  /* L3 */
+    return 3;  /* DRAM */
+}
+
+double bafe_cost_effective_bandwidth(size_t working_set_bytes, const bafe_cost_model *m) {
+    int level = bafe_cost_cache_level(working_set_bytes, m);
+    switch (level) {
+        case 0: return m->l1_bw_weight;
+        case 1: return m->l2_bw_weight;
+        case 2: return m->l3_bw_weight;
+        default: return m->dram_bw_weight;
+    }
+}
+
+bool bafe_cost_is_vectorizable(const char *op_name) {
+    if (!op_name) return false;
+    /* Elementwise ops on contiguous data are vectorizable */
+    if (strcmp(op_name, "add") == 0 || strcmp(op_name, "sub") == 0 ||
+        strcmp(op_name, "mul") == 0 || strcmp(op_name, "relu") == 0 ||
+        strcmp(op_name, "sigmoid") == 0 || strcmp(op_name, "tanh") == 0 ||
+        strcmp(op_name, "neg") == 0 || strcmp(op_name, "bias_add") == 0 ||
+        strcmp(op_name, "scale") == 0 || strcmp(op_name, "fused_bias_relu") == 0) {
+        return true;
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Layout conversion cost                                              */
+/* ------------------------------------------------------------------ */
 
 double bafe_cost_layout_conversion(const bafe_cost_model *m,
                                     const char *op_name,
@@ -121,11 +230,7 @@ double bafe_cost_layout_conversion(const bafe_cost_model *m,
                                     bafe_layout output_layout,
                                     const bafe_shape *inputs, int n_input_shapes) {
     (void)output_layout;
-    /* Determine the element size from the first input's dtype.
-     * Since we don't have dtype here, we use F32 (4 bytes) as the default.
-     * The cost model already scales by epsilon, so this is approximate. */
-    const size_t elem_size = 4;  /* F32 default */
-
+    const size_t elem_size = 4;
     if (n_inputs < 2) return 0.0;
     if (strcmp(op_name, "matmul") == 0 || bafe_op_is_fused(op_name)) {
         if (n_inputs >= 2 && input_layouts[0] == BAFE_LAYOUT_ROW_MAJOR
@@ -152,6 +257,26 @@ double bafe_cost_layout_conversion(const bafe_cost_model *m,
     return 0.0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Dtype-specific FLOP rate                                            */
+/* ------------------------------------------------------------------ */
+
+static double _dtype_flop_rate(bafe_dtype dtype) {
+    switch (dtype) {
+        case BAFE_DTYPE_F32: return 1.0;
+        case BAFE_DTYPE_F64: return 0.5;
+        case BAFE_DTYPE_F16: return 2.0;
+        case BAFE_DTYPE_BF16: return 2.0;
+        case BAFE_DTYPE_I32: return 1.0;
+        case BAFE_DTYPE_I64: return 0.5;
+        default: return 1.0;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Main cost computation (roofline model)                              */
+/* ------------------------------------------------------------------ */
+
 double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
                                    const bafe_shape *inputs, int n_inputs,
                                    const bafe_op_attrs *attrs,
@@ -160,8 +285,24 @@ double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
                                    bafe_layout output_layout) {
     double flops = bafe_cost_flops(op_name, inputs, n_inputs, attrs, out_shape);
     double bytes = bafe_cost_bytes(op_name, inputs, n_inputs, out_shape, dtype);
-    double cost = m->alpha_flops * flops + m->beta_bytes * bytes;
-    /* intermediate penalty */
+
+    /* Adjust FLOP cost by dtype rate (F16 is 2x faster, F64 is 0.5x) */
+    double flop_rate = _dtype_flop_rate(dtype);
+    double compute_cost = (flops / flop_rate) * m->alpha_flops;
+
+    /* Determine effective bandwidth based on working set size */
+    size_t working_set = 0;
+    for (int i = 0; i < n_inputs; i++) {
+        working_set += bafe_shape_nbytes(&inputs[i], dtype);
+    }
+    working_set += bafe_shape_nbytes(out_shape, dtype);
+    double bw_multiplier = bafe_cost_effective_bandwidth(working_set, m);
+    double memory_cost = bytes * m->beta_bytes / bw_multiplier;
+
+    /* Roofline: cost = max(compute, memory) + penalties */
+    double cost = compute_cost > memory_cost ? compute_cost : memory_cost;
+
+    /* Intermediate materialization penalty */
     if (!bafe_op_is_fused(op_name) &&
         strcmp(op_name, "input") != 0 &&
         strcmp(op_name, "constant") != 0 &&
@@ -171,10 +312,10 @@ double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
         strcmp(op_name, "layout_transform") != 0) {
         cost += m->gamma_intermediate;
     }
-    /* fusion bonus */
+
+    /* Fusion bonus */
     if (bafe_op_is_fused(op_name)) {
         cost -= m->delta_fuse;
-        /* Phase 2: extra bonus if all inputs share the same layout */
         if (n_input_layouts >= 2) {
             bool all_same = true;
             bafe_layout l0 = input_layouts[0];
@@ -186,11 +327,12 @@ double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
             }
         }
     }
-    /* Phase 2: layout conversion cost */
+
+    /* Layout conversion cost */
     cost += bafe_cost_layout_conversion(m, op_name, input_layouts, n_input_layouts,
                                          output_layout, inputs, n_inputs);
-    /* Phase 2: contiguous access bonus for matmul when A is row-major
-     * (the inner loop walks A contiguously, which is cache-friendly). */
+
+    /* Contiguous access bonus for matmul (A row-major = K contiguous) */
     if ((strcmp(op_name, "matmul") == 0 || bafe_op_is_fused(op_name)) &&
         n_input_layouts >= 1 && input_layouts[0] == BAFE_LAYOUT_ROW_MAJOR) {
         if (n_inputs >= 1) {
@@ -198,7 +340,30 @@ double bafe_cost_node_with_layout(const bafe_cost_model *m, const char *op_name,
             cost -= m->eta_contiguous * (double)a_bytes;
         }
     }
+
+    /* SIMD vectorization bonus for elementwise ops */
+    if (bafe_cost_is_vectorizable(op_name) && m->simd_width > 1) {
+        size_t out_n = bafe_shape_numel(out_shape);
+        /* Each SIMD instruction processes simd_width elements, saving
+         * (simd_width - 1) / simd_width of the scalar cost */
+        double simd_savings = (double)(m->simd_width - 1) / (double)m->simd_width;
+        cost -= m->simd_bonus * (double)out_n * simd_savings;
+    }
+
     return cost;
+}
+
+double bafe_cost_node(const bafe_cost_model *m, const char *op_name,
+                      const bafe_shape *inputs, int n_inputs,
+                      const bafe_op_attrs *attrs,
+                      const bafe_shape *out_shape, bafe_dtype dtype) {
+    bafe_layout layouts[BAFE_MAX_CHILDREN];
+    for (int i = 0; i < n_inputs && i < BAFE_MAX_CHILDREN; i++) {
+        layouts[i] = BAFE_LAYOUT_ROW_MAJOR;
+    }
+    return bafe_cost_node_with_layout(m, op_name, inputs, n_inputs, attrs,
+                                       out_shape, dtype,
+                                       layouts, n_inputs, BAFE_LAYOUT_ROW_MAJOR);
 }
 
 double bafe_cost_graph(const bafe_cost_model *m, const bafe_graph *g) {
@@ -220,12 +385,10 @@ double bafe_cost_graph(const bafe_cost_model *m, const bafe_graph *g) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Phase 3 (issue #5): Calibration                                     */
+/* Calibration                                                         */
 /* ------------------------------------------------------------------ */
 
 static double _clamp_scale(double w, double avg) {
-    /* If the weight is near zero, the feature has no correlation with
-     * runtime — don't scale (return 1.0). */
     if (fabs(w) < avg * 0.1) return 1.0;
     double s = fabs(w) / avg;
     if (s < 0.1) s = 0.1;
@@ -245,11 +408,9 @@ bafe_cost_model bafe_cost_model_calibrate(const bafe_cost_model *static_model,
     double avg_abs = sum_abs / (double)n_weights;
     if (avg_abs < 1e-9) return out;
 
-    /* feature[4] = log_flops -> alpha_flops */
     double s_flops = _clamp_scale(learned_weights[4], avg_abs);
     out.alpha_flops = static_model->alpha_flops * s_flops;
 
-    /* feature[5] = log_bytes -> beta_bytes */
     double s_bytes = _clamp_scale(learned_weights[5], avg_abs);
     if (learned_weights[5] >= 0) {
         out.beta_bytes = static_model->beta_bytes * s_bytes;
@@ -257,7 +418,6 @@ bafe_cost_model bafe_cost_model_calibrate(const bafe_cost_model *static_model,
         out.beta_bytes = static_model->beta_bytes / s_bytes;
     }
 
-    /* feature[3] = num_fused -> delta_fuse */
     double s_fused = _clamp_scale(learned_weights[3], avg_abs);
     if (learned_weights[3] < 0) {
         out.delta_fuse = static_model->delta_fuse * s_fused;
@@ -265,7 +425,6 @@ bafe_cost_model bafe_cost_model_calibrate(const bafe_cost_model *static_model,
         out.delta_fuse = static_model->delta_fuse / s_fused;
     }
 
-    /* feature[6] = num_intermediates -> gamma_intermediate */
     double s_inter = _clamp_scale(learned_weights[6], avg_abs);
     if (learned_weights[6] >= 0) {
         out.gamma_intermediate = static_model->gamma_intermediate * s_inter;

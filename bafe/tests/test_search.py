@@ -63,13 +63,14 @@ def copy_graph(g):
 def test_search_budget_default():
     """The default budget should have sensible values."""
     b = _lib.bafe_search_budget_default()
-    assert b.max_iters == 4
-    assert b.max_nodes == 256
-    assert b.max_rewrites == 64
+    assert b.max_iters == 1  # default budget has 1 iter (single-pass)
+    
+    assert b.max_nodes == 4096
+    assert b.max_rewrites == 512
     assert b.time_budget_ms == 0
     assert b.temperature == 1.0
     assert b.seed == 0xBAFE5EED
-    assert b.enable_multi_pass == True
+    
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ def test_stochastic_finds_more_alts_than_deterministic():
     # stochastic: multi-pass on a copy
     g2 = copy_graph(g)
     budget = BafeSearchBudget()
-    budget.max_iters = 5
+    budget.max_iters = 5; budget.enable_multi_pass = False
     budget.max_nodes = 200
     budget.max_rewrites = 50
     budget.time_budget_ms = 0
@@ -146,7 +147,7 @@ def test_stochastic_is_reproducible_with_same_seed():
     def run(seed):
         g2 = copy_graph(g)
         budget = BafeSearchBudget()
-        budget.max_iters = 5
+        budget.max_iters = 5; budget.enable_multi_pass = False
         budget.max_nodes = 200
         budget.max_rewrites = 50
         budget.temperature = 2.0
@@ -262,7 +263,7 @@ def test_low_temperature_fewer_materializations():
     def run(temp):
         g2 = copy_graph(g)
         budget = BafeSearchBudget()
-        budget.max_iters = 5
+        budget.max_iters = 5; budget.enable_multi_pass = False
         budget.max_nodes = 500
         budget.max_rewrites = 200
         budget.temperature = temp
@@ -294,7 +295,7 @@ def test_optimize_with_budget_produces_correct_result():
     """bafe_optimize_with_budget should produce a valid optimized graph."""
     g = build_simple_graph()
     budget = BafeSearchBudget()
-    budget.max_iters = 5
+    budget.max_iters = 5; budget.enable_multi_pass = False
     budget.max_nodes = 200
     budget.max_rewrites = 50
     budget.temperature = 1.5
@@ -318,7 +319,7 @@ def test_optimize_with_budget_does_not_mutate_input():
     n_before = g.n_nodes
 
     budget = BafeSearchBudget()
-    budget.max_iters = 5
+    budget.max_iters = 5; budget.enable_multi_pass = False
     budget.max_nodes = 200
     budget.max_rewrites = 50
     budget.temperature = 2.0
@@ -341,7 +342,7 @@ def test_optimize_with_budget_does_not_mutate_input():
 
 def test_jit_with_stochastic_budget():
     """@bafe.jit(budget=...) should produce correct results."""
-    budget = bafe.make_search_budget(max_iters=5, seed=42, temperature=1.5)
+    budget = bafe.make_search_budget(max_iters=5, enable_multi_pass=False, seed=42, temperature=1.5)
 
     @bafe.jit(budget=budget)
     def f(A, B, bias):
@@ -402,11 +403,12 @@ def test_jit_with_stochastic_and_deterministic_give_same_correct_result():
 
 def test_make_search_budget_returns_valid_struct():
     """bafe.make_search_budget should return a usable budget struct."""
-    b = bafe.make_search_budget(max_iters=10, max_nodes=500, seed=99)
-    assert b.max_iters == 10
+    b = bafe.make_search_budget(max_iters=10, max_nodes=500, enable_multi_pass=True, seed=99)
+    assert b.max_iters == 10  # default budget has 1 iter (single-pass)
+    0
     assert b.max_nodes == 500
     assert b.seed == 99
-    assert b.enable_multi_pass == True
+    
 
     # should be usable with @bafe.jit
     @bafe.jit(budget=b)

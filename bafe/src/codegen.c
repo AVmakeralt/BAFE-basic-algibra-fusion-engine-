@@ -297,8 +297,33 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             char op = strcmp(n->op_name, "add") == 0 ? '+' :
                       strcmp(n->op_name, "sub") == 0 ? '-' : '*';
-            _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s[i] = %s[i] %c %s[i];\n",
-                    numel, vname, a_name, op, b_name);
+            const bafe_node *a_node = &g->nodes[n->children[0]];
+            const bafe_node *b_node = &g->nodes[n->children[1]];
+            /* Check for broadcasting: if one input is rank-1 and the other
+             * is rank-2, broadcast the rank-1 input on the last dimension. */
+            if (a_node->shape.rank == 2 && b_node->shape.rank == 1 &&
+                a_node->shape.dims[1] == b_node->shape.dims[0]) {
+                /* (M, N) + (N,) -> broadcast (N,) on last dim */
+                int M = a_node->shape.dims[0], N = a_node->shape.dims[1];
+                _append(out, out_size, &pos,
+                    "    for (int i = 0; i < %d; i++)\n"
+                    "      for (int j = 0; j < %d; j++)\n"
+                    "        %s[i * %d + j] = %s[i * %d + j] %c %s[j];\n",
+                    M, N, vname, N, a_name, N, op, b_name);
+            } else if (a_node->shape.rank == 1 && b_node->shape.rank == 2 &&
+                       a_node->shape.dims[0] == b_node->shape.dims[1]) {
+                /* (N,) + (M, N) -> broadcast (N,) on last dim */
+                int M = b_node->shape.dims[0], N = b_node->shape.dims[1];
+                _append(out, out_size, &pos,
+                    "    for (int i = 0; i < %d; i++)\n"
+                    "      for (int j = 0; j < %d; j++)\n"
+                    "        %s[i * %d + j] = %s[j] %c %s[i * %d + j];\n",
+                    M, N, vname, N, a_name, op, b_name, N);
+            } else {
+                /* Same-shape elementwise (no broadcasting) */
+                _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s[i] = %s[i] %c %s[i];\n",
+                        numel, vname, a_name, op, b_name);
+            }
         } else if (strcmp(n->op_name, "bias_add") == 0) {
             char x_name[32]; _var_name(x_name, sizeof(x_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);

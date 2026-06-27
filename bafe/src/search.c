@@ -30,13 +30,30 @@
 
 bafe_search_budget bafe_search_budget_default(void) {
     bafe_search_budget b;
-    b.max_iters = 4;
-    b.max_nodes = 256;
-    b.max_rewrites = 64;
-    b.time_budget_ms = 0;       /* no time limit by default */
+    /* The superoptimizer runs automatically on every @bafe.jit call.
+     * Default: single-pass deterministic rewrites + full e-graph + cost model.
+     * This is fast and correct. Multi-pass stochastic search is enabled
+     * via @bafe.jit(deep=True) or @bafe.jit(iters=N). */
+    b.max_iters = 1;
+    b.max_nodes = 4096;
+    b.max_rewrites = 512;
+    b.time_budget_ms = 0;
     b.temperature = 1.0;
     b.seed = 0xBAFE5EEDu;
-    b.enable_multi_pass = true;
+    b.enable_multi_pass = false;
+    b.deep_search = false;
+    return b;
+}
+
+bafe_search_budget bafe_search_budget_deep(void) {
+    bafe_search_budget b = bafe_search_budget_default();
+    /* Deep search: maximum exploration for large workloads.
+     * Uses more memory but finds more optimizations. */
+    b.max_iters = 16;
+    b.max_nodes = 16384;
+    b.max_rewrites = 2000;
+    b.temperature = 2.0;        /* more exploration */
+    b.deep_search = true;
     return b;
 }
 

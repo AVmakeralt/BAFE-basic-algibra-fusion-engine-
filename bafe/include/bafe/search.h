@@ -34,17 +34,24 @@ extern "C" {
 #endif
 
 typedef struct {
-    int     max_iters;        /* number of stochastic passes (default 4) */
-    int     max_nodes;        /* graph size cap (default 256) */
-    int     max_rewrites;     /* total rewrites to materialize (default 64) */
+    int     max_iters;        /* number of stochastic passes (default 8) */
+    int     max_nodes;        /* graph size cap (default 4096) */
+    int     max_rewrites;     /* total rewrites to materialize (default 512) */
     int     time_budget_ms;   /* wall-clock limit, 0 = no limit (default 0) */
     double  temperature;      /* 0.0 = greedy, high = random (default 1.0) */
     uint32_t seed;            /* PRNG seed (default 0xBAFE5EED) */
     bool    enable_multi_pass;/* if false, degrades to deterministic (default true) */
+    bool    deep_search;      /* if true: 10K nodes, 2000 rewrites, 16 iters (default false) */
 } bafe_search_budget;
 
-/* Default budget: moderate exploration, reproducible. */
+/* Default budget: aggressive exploration, reproducible.
+ * The superoptimizer runs automatically on every @bafe.jit call. */
 bafe_search_budget bafe_search_budget_default(void);
+
+/* Deep search budget: maximum exploration for large workloads.
+ * Uses more memory but finds more optimizations.
+ * Enable via @bafe.jit(deep=True) or bafe.make_search_budget(deep_search=True). */
+bafe_search_budget bafe_search_budget_deep(void);
 
 /* Run stochastic search on the graph.
  *

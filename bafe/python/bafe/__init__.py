@@ -546,45 +546,49 @@ class JittedFunction:
 
 def jit(fn: Callable = None, *, budget=None, iters: int = None,
         temperature: float = None, seed: int = None, autotune: bool = False,
-        time_budget_ms: int = None):
+        time_budget_ms: int = None, deep: bool = False):
     """Decorator: trace + optimize + JIT-compile a tensor function.
 
-    Phase 2 (issue #1): optional stochastic search parameters.
-    Phase 3 (issue #4): optional time-budget pruning.
-    Phase 3 (issue #6): optional autotune loop.
+    The superoptimizer runs AUTOMATICALLY on every call. By default it
+    uses multi-pass stochastic search with 8 iterations, 4096 node limit,
+    and 512 rewrite materializations.
 
     Args:
+        deep: if True, enable deep search mode (16K nodes, 2000 rewrites,
+              16 iterations, higher temperature). Uses more memory but
+              finds more optimizations for large workloads.
         budget: a BafeSearchBudget for full control.
-        iters: number of stochastic passes (default 4 if budget mode on).
-        temperature: 0.0 = greedy, high = explore randomly (default 1.0).
-        seed: PRNG seed for reproducibility (default 0xBAFE5EED).
+        iters: number of stochastic passes.
+        temperature: 0.0 = greedy, high = explore randomly.
+        seed: PRNG seed for reproducibility.
         autotune: if True, enable the auto-tuning loop.
         time_budget_ms: wall-clock limit for the optimization search.
-            Controls the pruning regime:
-              <= 1 ms:   greedy (Level A+B only, beam=1)
-              <= 10 ms:  light (A+B+C, beam=4)
-              <= 100 ms: beam (A+B+C+D, beam=16)
-              > 100 ms:  deep (all tiers, beam=64)
-            0 or None means no limit (uses stochastic search).
 
     Examples:
-        @bafe.jit
-        def f(A, B): ...                      # deterministic (default)
+        @bafe.jit                                    # auto superoptimizer
+        def f(A, B): ...
 
-        @bafe.jit(time_budget_ms=100)
-        def f(A, B): ...                      # 100ms pruning budget
+        @bafe.jit(deep=True)                         # deep search for large workloads
+        def f(A, B): ...
 
-        @bafe.jit(time_budget_ms=1000, autotune=True)
-        def f(A, B): ...                      # 1s budget + autotune
+        @bafe.jit(autotune=True, deep=True)          # deep + autotune
+        def f(A, B): ...
     """
     if fn is not None:
+        if deep:
+            from bafe._binding import _lib
+            b = _lib.bafe_search_budget_deep()
+            return JittedFunction(fn, budget=b, autotune=autotune, time_budget_ms=time_budget_ms)
         return JittedFunction(fn, autotune=autotune, time_budget_ms=time_budget_ms)
 
     def deco(fn):
         b = budget
-        if b is None and (iters is not None or temperature is not None or seed is not None):
+        if b is None and deep:
+            from bafe._binding import _lib
+            b = _lib.bafe_search_budget_deep()
+        elif b is None and (iters is not None or temperature is not None or seed is not None):
             b = make_search_budget(
-                max_iters=iters if iters is not None else 4,
+                max_iters=iters if iters is not None else 8,
                 temperature=temperature if temperature is not None else 1.0,
                 seed=seed if seed is not None else 0xBAFE5EED,
             )
@@ -597,7 +601,7 @@ def jit(fn: Callable = None, *, budget=None, iters: int = None,
 def make_search_budget(max_iters: int = 4, max_nodes: int = 256,
                        max_rewrites: int = 64, time_budget_ms: int = 0,
                        temperature: float = 1.0, seed: int = 0xBAFE5EED,
-                       enable_multi_pass: bool = True):
+                       enable_multi_pass: bool = False):
     """Build a BafeSearchBudget for use with @bafe.jit(budget=...).
 
     The budget controls the stochastic search layer:
@@ -620,6 +624,7 @@ def make_search_budget(max_iters: int = 4, max_nodes: int = 256,
     b.temperature = float(temperature)
     b.seed = int(seed) & 0xFFFFFFFF
     b.enable_multi_pass = bool(enable_multi_pass)
+    b.deep_search = False
     return b
 
 

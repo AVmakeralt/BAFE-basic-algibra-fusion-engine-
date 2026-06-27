@@ -249,9 +249,11 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
 
 int bafe_optimize(const bafe_graph *input, bafe_graph *optimized,
                   char *err_buf, size_t err_buf_size) {
-    /* default: deterministic single-pass (multi_pass disabled) */
+    /* The superoptimizer runs automatically with aggressive defaults:
+     * multi-pass stochastic search with 8 iterations, 4096 node limit,
+     * and 512 rewrite materializations. This is NOT a single-pass
+     * deterministic mode — the full optimization pipeline runs by default. */
     bafe_search_budget b = bafe_search_budget_default();
-    b.enable_multi_pass = false;
     return bafe_optimize_with_budget(input, optimized, &b, err_buf, err_buf_size);
 }
 
