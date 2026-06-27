@@ -30,6 +30,8 @@ typedef enum {
     BAFE_DTYPE_F64 = 1,
     BAFE_DTYPE_I32 = 2,
     BAFE_DTYPE_I64 = 3,
+    BAFE_DTYPE_F16 = 4,     /* IEEE half-precision (16-bit float) */
+    BAFE_DTYPE_BF16 = 5,    /* Google Brain float (16-bit, 8 exp, 7 mantissa) */
 } bafe_dtype;
 
 /* C99 type name for a dtype, e.g. "float" or "int32_t". */

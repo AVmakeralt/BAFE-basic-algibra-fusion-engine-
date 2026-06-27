@@ -7,22 +7,22 @@
 /* Dtype                                                              */
 /* ------------------------------------------------------------------ */
 
-static const char *const _c_names[] = {"float", "double", "int32_t", "int64_t"};
-static const char *const _np_names[] = {"float32", "float64", "int32", "int64"};
-static const size_t   _bytes[]      = {4, 8, 4, 8};
+static const char *const _c_names[] = {"float", "double", "int32_t", "int64_t", "uint16_t", "uint16_t"};
+static const char *const _np_names[] = {"float32", "float64", "int32", "int64", "float16", "bfloat16"};
+static const size_t   _bytes[]      = {4, 8, 4, 8, 2, 2};
 
 const char *bafe_dtype_c_name(bafe_dtype d) {
-    if ((int)d < 0 || (int)d > 3) return "float";
+    if ((int)d < 0 || (int)d > 5) return "float";
     return _c_names[(int)d];
 }
 
 const char *bafe_dtype_numpy_name(bafe_dtype d) {
-    if ((int)d < 0 || (int)d > 3) return "float32";
+    if ((int)d < 0 || (int)d > 5) return "float32";
     return _np_names[(int)d];
 }
 
 size_t bafe_dtype_byte_size(bafe_dtype d) {
-    if ((int)d < 0 || (int)d > 3) return 4;
+    if ((int)d < 0 || (int)d > 5) return 4;
     return _bytes[(int)d];
 }
 
@@ -32,6 +32,8 @@ bafe_dtype bafe_dtype_from_str(const char *s) {
     if (!strcmp(s, "f64") || !strcmp(s, "float64") || !strcmp(s, "double")) return BAFE_DTYPE_F64;
     if (!strcmp(s, "i32") || !strcmp(s, "int32") || !strcmp(s, "int"))     return BAFE_DTYPE_I32;
     if (!strcmp(s, "i64") || !strcmp(s, "int64") || !strcmp(s, "long"))    return BAFE_DTYPE_I64;
+    if (!strcmp(s, "f16") || !strcmp(s, "float16") || !strcmp(s, "half"))  return BAFE_DTYPE_F16;
+    if (!strcmp(s, "bf16") || !strcmp(s, "bfloat16"))                      return BAFE_DTYPE_BF16;
     return BAFE_DTYPE_F32;
 }
 

@@ -37,9 +37,14 @@ _NP_TO_BAFE = {
     np.dtype("float64"): 1,  # BAFE_DTYPE_F64
     np.dtype("int32"):   2,  # BAFE_DTYPE_I32
     np.dtype("int64"):   3,  # BAFE_DTYPE_I64
+    np.dtype("float16"): 4,  # BAFE_DTYPE_F16
 }
 
+# BF16 is not a native numpy dtype, so we use a custom representation.
+# We store BF16 data as uint16 arrays, with the dtype name "bfloat16".
+# The binding handles the conversion at the FFI boundary.
 _BAFE_TO_NP = {v: k for k, v in _NP_TO_BAFE.items()}
+_BAFE_TO_NP[5] = np.dtype("float32")  # BF16: we'll convert to/from float32 at the boundary
 
 
 # ---------------------------------------------------------------------------
@@ -141,13 +146,20 @@ class Tensor:
 
     def __matmul__(self, other: "Tensor") -> "Tensor":
         tc = _ensure_trace()
-        if len(self.shape) != 2 or len(other.shape) != 2:
-            raise ValueError("matmul requires rank-2 tensors")
-        if self.shape[1] != other.shape[0]:
+        # Support both rank-2 and batched (rank > 2) matmul
+        if len(self.shape) < 2 or len(other.shape) < 2:
+            raise ValueError("matmul requires rank>=2 tensors")
+        if self.shape[-1] != other.shape[-2]:
             raise ValueError(
-                f"matmul shape mismatch: {self.shape} @ {other.shape}"
+                f"matmul shape mismatch: {self.shape} @ {other.shape} (K dim must match)"
             )
-        out_shape = (self.shape[0], other.shape[1])
+        if len(self.shape) == 2 and len(other.shape) == 2:
+            out_shape = (self.shape[0], other.shape[1])
+        else:
+            # batched: broadcast leading dims, output = (batch..., M, N)
+            out_shape = tuple(max(s1, s2) for s1, s2 in zip(
+                self.shape[:-2], other.shape[:-2]
+            )) + (self.shape[-2], other.shape[-1])
         nid = tc.add_op("matmul", [self.node_id, other.node_id])
         return Tensor(nid, out_shape, self.dtype)
 

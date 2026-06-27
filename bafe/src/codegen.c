@@ -41,11 +41,15 @@ static int _append(char *buf, size_t buf_size, size_t *pos, const char *fmt, ...
 
 /* emit a unique local var name for a node.
  * For input nodes, returns the parameter name (e.g. "A_ptr").
+ * For F16/BF16 inputs, returns the converted float buffer name (e.g. "A_f32").
  * For other nodes, returns "v<id>". */
 static int _var_name(char *buf, size_t buf_size, const bafe_graph *g, bafe_node_id id) {
     if (id < 0 || id >= g->n_nodes) return snprintf(buf, buf_size, "v_invalid");
     const bafe_node *n = &g->nodes[id];
     if (n->is_input) {
+        if (n->dtype == BAFE_DTYPE_F16 || n->dtype == BAFE_DTYPE_BF16) {
+            return snprintf(buf, buf_size, "%s_f32", n->input_name);
+        }
         return snprintf(buf, buf_size, "%s_ptr", n->input_name);
     }
     if (n->is_constant) {
@@ -78,7 +82,51 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
     _append(out, out_size, &pos, "#include <math.h>\n");
     _append(out, out_size, &pos, "#include <string.h>\n\n");
 
-    /* function signature: void name(const float* A, const float* B, ..., float* out) */
+    /* Check if any node uses F16 or BF16; if so, emit conversion helpers */
+    bool need_f16 = false, need_bf16 = false;
+    for (int i = 0; i < g->n_nodes; i++) {
+        if (g->nodes[i].dtype == BAFE_DTYPE_F16) need_f16 = true;
+        if (g->nodes[i].dtype == BAFE_DTYPE_BF16) need_bf16 = true;
+    }
+    if (need_f16) {
+        _append(out, out_size, &pos,
+            "/* F16 (IEEE half) conversion helpers */\n"
+            "static float bafe_f16_to_f32(uint16_t h) {\n"
+            "    uint32_t sign = ((uint32_t)(h & 0x8000)) << 16;\n"
+            "    uint32_t exp = ((uint32_t)((h >> 10) & 0x1F)) + 112;\n"
+            "    uint32_t mant = ((uint32_t)(h & 0x3FF)) << 13;\n"
+            "    if ((h & 0x7FFF) == 0) return *(float*)&sign;\n"
+            "    if ((h & 0x7C00) == 0x7C00) { uint32_t nan = sign | 0x7F800000 | mant; return *(float*)&nan; }\n"
+            "    uint32_t bits = sign | (exp << 23) | mant;\n"
+            "    return *(float*)&bits;\n"
+            "}\n"
+            "static uint16_t bafe_f32_to_f16(float f) {\n"
+            "    uint32_t bits = *(uint32_t*)&f;\n"
+            "    uint16_t sign = (bits >> 16) & 0x8000;\n"
+            "    int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;\n"
+            "    uint32_t mant = (bits >> 13) & 0x3FF;\n"
+            "    if (exp <= 0) { if (exp < -10) return sign; mant = (mant | 0x400) >> (1 - exp); return sign | mant; }\n"
+            "    if (exp >= 31) return sign | 0x7C00;\n"
+            "    return sign | (exp << 10) | mant;\n"
+            "}\n\n");
+    }
+    if (need_bf16) {
+        _append(out, out_size, &pos,
+            "/* BF16 conversion helpers */\n"
+            "static float bafe_bf16_to_f32(uint16_t b) {\n"
+            "    uint32_t bits = ((uint32_t)b) << 16;\n"
+            "    return *(float*)&bits;\n"
+            "}\n"
+            "static uint16_t bafe_f32_to_bf16(float f) {\n"
+            "    uint32_t bits = *(uint32_t*)&f;\n"
+            "    /* round-to-nearest-even */\n"
+            "    uint32_t rounding_bias = 0x7FFF + ((bits >> 16) & 1);\n"
+            "    bits += rounding_bias;\n"
+            "    return (uint16_t)(bits >> 16);\n"
+            "}\n\n");
+    }
+
+    /* function signature: void name(const T* A, const T* B, ..., T* out) */
     _append(out, out_size, &pos, "void %s(", kernel_name);
     for (int i = 0; i < g->n_inputs; i++) {
         const bafe_node *in = &g->nodes[g->inputs[i]];
@@ -106,6 +154,20 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
     bafe_node_id order[BAFE_MAX_NODES];
     int n_order = bafe_graph_topo_order((bafe_graph *)g, order, BAFE_MAX_NODES);
 
+    /* For F16/BF16 inputs, emit converted float copies so all downstream
+     * ops can use float arithmetic. The converted buffer uses the same
+     * name as the input (e.g. A_ptr -> A_f32) but is a float[]. */
+    for (int i = 0; i < g->n_inputs; i++) {
+        const bafe_node *in = &g->nodes[g->inputs[i]];
+        if (in->dtype == BAFE_DTYPE_F16 || in->dtype == BAFE_DTYPE_BF16) {
+            size_t numel = bafe_shape_numel(&in->shape);
+            const char *conv = (in->dtype == BAFE_DTYPE_F16) ? "bafe_f16_to_f32" : "bafe_bf16_to_f32";
+            _append(out, out_size, &pos, "    float %s_f32[%zu];\n", in->input_name, numel);
+            _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s_f32[i] = %s(%s_ptr[i]);\n",
+                    numel, in->input_name, conv, in->input_name);
+        }
+    }
+
     /* emit each node */
     for (int idx = 0; idx < n_order; idx++) {
         bafe_node_id nid = order[idx];
@@ -115,18 +177,23 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
         char vname[32]; _var_name(vname, sizeof(vname), g, nid);
         _emit_shape_decl(out, out_size, &pos, vname, &n->shape);
 
-        /* allocate a local buffer for the result */
+        /* allocate a local buffer for the result.
+         * For F16/BF16, we use float buffers internally and convert
+         * at the input/output boundaries. This matches what ML frameworks
+         * do (compute in F32, store in F16/BF16). */
         size_t numel = bafe_shape_numel(&n->shape);
         const char *ctype = bafe_dtype_c_name(n->dtype);
-        _append(out, out_size, &pos, "    %s %s[%zu];\n", ctype, vname, numel);
+        bool is_half = (n->dtype == BAFE_DTYPE_F16 || n->dtype == BAFE_DTYPE_BF16);
+        const char *buf_type = is_half ? "float" : ctype;
+        _append(out, out_size, &pos, "    %s %s[%zu];\n", buf_type, vname, numel);
 
         /* emit computation */
         if (strcmp(n->op_name, "matmul") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
             const bafe_node *b = &g->nodes[n->children[1]];
-            int M = n->shape.dims[0];
-            int N = n->shape.dims[1];
-            int K = a->shape.dims[1];
+            int M = n->shape.dims[n->shape.rank - 2];
+            int N = n->shape.dims[n->shape.rank - 1];
+            int K = a->shape.dims[a->shape.rank - 1];
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             /* Phase 2: layout-aware index expressions.
@@ -144,12 +211,32 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 : "%s[k * %d + j]";  /* row-major: B[k*N + j] */
             int a_stride = (a->layout == BAFE_LAYOUT_COL_MAJOR) ? M : K;
             int b_stride = (b->layout == BAFE_LAYOUT_COL_MAJOR) ? K : N;
+
+            /* For batched matmul (rank > 2), compute batch strides and emit
+             * an outer loop over batch elements. */
+            int batch_rank = n->shape.rank - 2;
+            int batch_size = 1;
+            for (int d = 0; d < batch_rank; d++) batch_size *= n->shape.dims[d];
+            int a_batch_stride = M * K;
+            int b_batch_stride = K * N;
+            int out_batch_stride = M * N;
+
             /* zero output */
-            _append(out, out_size, &pos, "    for (int i = 0; i < %d*%d; i++) %s[i] = 0;\n", M, N, vname);
+            _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s[i] = 0;\n", numel, vname);
             _append(out, out_size, &pos,
-                "    /* matmul: A layout=%s, B layout=%s */\n",
-                bafe_layout_name(a->layout), bafe_layout_name(b->layout));
+                "    /* matmul: A layout=%s, B layout=%s, rank=%d */\n",
+                bafe_layout_name(a->layout), bafe_layout_name(b->layout), n->shape.rank);
+
+            /* batch loop (if rank > 2) */
+            if (batch_rank > 0) {
+                _append(out, out_size, &pos, "    for (int b = 0; b < %d; b++) {\n", batch_size);
+                _append(out, out_size, &pos, "      int a_off = b * %d;\n", a_batch_stride);
+                _append(out, out_size, &pos, "      int b_off = b * %d;\n", b_batch_stride);
+                _append(out, out_size, &pos, "      int o_off = b * %d;\n", out_batch_stride);
+            }
             /* tiled matmul with layout-aware access */
+            /* For batched matmul, the batch offset goes INSIDE the array index:
+             * A_f32[a_off + i * K + k]  (not  a_off + A_f32[i * K + k]) */
             _append(out, out_size, &pos,
                 "    for (int ii = 0; ii < %d; ii += %d) {\n"
                 "      for (int jj = 0; jj < %d; jj += %d) {\n"
@@ -160,21 +247,50 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "              for (int k = kk; k < kk + %d && k < %d; k++) {\n",
                 M, MATMUL_TILE, N, MATMUL_TILE, K, MATMUL_TILE,
                 MATMUL_TILE, M, MATMUL_TILE, N,
-                ctype, MATMUL_TILE, K);
-            /* emit the access expression with layout-aware strides */
-            char a_expr[128], b_expr[128];
-            snprintf(a_expr, sizeof(a_expr), a_idx, a_name, a_stride);
-            snprintf(b_expr, sizeof(b_expr), b_idx, b_name, b_stride);
+                buf_type, MATMUL_TILE, K);
+            /* build the access expressions with batch offset inside the index */
+            char a_full[512], b_full[512];
+            if (batch_rank > 0) {
+                /* batched: A_name[a_off + i * stride + k]
+                 * a_idx is like "%s[i * %d + k]" — we substitute the name
+                 * and stride, then inject a_off into the brackets */
+                char tmp[256];
+                snprintf(tmp, sizeof(tmp), a_idx, a_name, a_stride);
+                /* tmp is now "A_f32[i * 8 + k]" — insert a_off after the [ */
+                char *bracket = strchr(tmp, '[');
+                if (bracket) {
+                    *bracket = '\0';  /* tmp now = "A_f32" */
+                    snprintf(a_full, sizeof(a_full), "%s[a_off + %s", tmp, bracket + 1);
+                } else {
+                    snprintf(a_full, sizeof(a_full), "%s", tmp);
+                }
+                snprintf(tmp, sizeof(tmp), b_idx, b_name, b_stride);
+                bracket = strchr(tmp, '[');
+                if (bracket) {
+                    *bracket = '\0';
+                    snprintf(b_full, sizeof(b_full), "%s[b_off + %s", tmp, bracket + 1);
+                } else {
+                    snprintf(b_full, sizeof(b_full), "%s", tmp);
+                }
+            } else {
+                snprintf(a_full, sizeof(a_full), a_idx, a_name, a_stride);
+                snprintf(b_full, sizeof(b_full), b_idx, b_name, b_stride);
+            }
             _append(out, out_size, &pos,
                 "                acc += %s * %s;\n"
                 "              }\n"
-                "              %s[i * %d + j] += acc;\n"
+                "              %s[%si * %d + j%s] += acc;\n"
                 "            }\n"
                 "          }\n"
                 "        }\n"
                 "      }\n"
                 "    }\n",
-                a_expr, b_expr, vname, N, vname);
+                a_full, b_full, vname,
+                batch_rank > 0 ? "o_off + " : "", N,
+                batch_rank > 0 ? "" : "");
+            if (batch_rank > 0) {
+                _append(out, out_size, &pos, "    }\n");  /* close batch loop */
+            }
         } else if (strcmp(n->op_name, "add") == 0 || strcmp(n->op_name, "sub") == 0 ||
                    strcmp(n->op_name, "mul") == 0) {
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
@@ -200,7 +316,7 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "    for (int i = 0; i < %zu; i++) {\n"
                 "      %s v = %s[i];\n"
                 "      %s[i] = v > 0 ? v : 0;\n"
-                "    }\n", numel, ctype, x_name, vname);
+                "    }\n", numel, buf_type, x_name, vname);
         } else if (strcmp(n->op_name, "sigmoid") == 0) {
             char x_name[32]; _var_name(x_name, sizeof(x_name), g, n->children[0]);
             _append(out, out_size, &pos,
@@ -325,21 +441,27 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                     numel * bafe_dtype_byte_size(n->dtype));
         } else if (strcmp(n->op_name, "fused_matmul_relu") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
-            int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];
+            int M = n->shape.dims[n->shape.rank-2], N = n->shape.dims[n->shape.rank-1], K = a->shape.dims[a->shape.rank-1];
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
+            int br = n->shape.rank - 2; int bs = 1; for (int d=0; d<br; d++) bs *= n->shape.dims[d];
+            int abs_ = M*K, bbs_ = K*N, obs_ = M*N;
+            if (br > 0) _append(out, out_size, &pos, "    for (int b = 0; b < %d; b++) {\n", bs);
+            const char *ao = br > 0 ? "a_off + " : ""; const char *bo = br > 0 ? "b_off + " : ""; const char *oo = br > 0 ? "o_off + " : "";
+            if (br > 0) { _append(out, out_size, &pos, "      int a_off = b*%d, b_off = b*%d, o_off = b*%d;\n", abs_, bbs_, obs_); }
             _append(out, out_size, &pos,
                 "    for (int i = 0; i < %d; i++)\n"
                 "      for (int j = 0; j < %d; j++) {\n"
                 "        %s acc = 0;\n"
                 "        for (int k = 0; k < %d; k++)\n"
-                "          acc += %s[i * %d + k] * %s[k * %d + j];\n"
-                "        %s[i * %d + j] = acc > 0 ? acc : 0;\n"
+                "          acc += %s[%si * %d + k] * %s[%sk * %d + j];\n"
+                "        %s[%si * %d + j] = acc > 0 ? acc : 0;\n"
                 "      }\n",
-                M, N, ctype, K, a_name, K, b_name, N, vname, N);
+                M, N, buf_type, K, a_name, ao, K, b_name, bo, N, vname, oo, N);
+            if (br > 0) _append(out, out_size, &pos, "    }\n");
         } else if (strcmp(n->op_name, "fused_matmul_bias") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
-            int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];
+            int M = n->shape.dims[n->shape.rank-2], N = n->shape.dims[n->shape.rank-1], K = a->shape.dims[a->shape.rank-1];
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             char bias_name[32]; _var_name(bias_name, sizeof(bias_name), g, n->children[2]);
@@ -351,10 +473,10 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "          acc += %s[i * %d + k] * %s[k * %d + j];\n"
                 "        %s[i * %d + j] = acc + %s[j];\n"
                 "      }\n",
-                M, N, ctype, K, a_name, K, b_name, N, vname, N, bias_name);
+                M, N, buf_type, K, a_name, K, b_name, N, vname, N, bias_name);
         } else if (strcmp(n->op_name, "fused_matmul_bias_relu") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
-            int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];
+            int M = n->shape.dims[n->shape.rank-2], N = n->shape.dims[n->shape.rank-1], K = a->shape.dims[a->shape.rank-1];
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             char bias_name[32]; _var_name(bias_name, sizeof(bias_name), g, n->children[2]);
@@ -367,7 +489,7 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "        acc += %s[j];\n"
                 "        %s[i * %d + j] = acc > 0 ? acc : 0;\n"
                 "      }\n",
-                M, N, ctype, K, a_name, K, b_name, N, bias_name, vname, N);
+                M, N, buf_type, K, a_name, K, b_name, N, bias_name, vname, N);
         } else if (strcmp(n->op_name, "fused_bias_relu") == 0) {
             char x_name[32]; _var_name(x_name, sizeof(x_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
@@ -378,7 +500,7 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "        %s v = %s[i * %d + j] + %s[j];\n"
                 "        %s[i * %d + j] = v > 0 ? v : 0;\n"
                 "      }\n",
-                M, N, ctype, x_name, N, b_name, vname, N);
+                M, N, buf_type, x_name, N, b_name, vname, N);
         } else {
             /* Unknown op: emit an error comment + zero-fill (fail loudly in debug) */
             _append(out, out_size, &pos, "    /* ERROR: unsupported op %s, zero-filling */\n", n->op_name);
@@ -386,13 +508,22 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
         }
     }
 
-    /* copy final output to out_ptr */
+    /* copy final output to out_ptr.
+     * For F16/BF16, convert from the internal float buffer back to uint16. */
     bafe_node_id out_id = g->outputs[0];
     const bafe_node *out_node = &g->nodes[out_id];
     char out_vname[32]; _var_name(out_vname, sizeof(out_vname), g, out_id);
     size_t out_numel = bafe_shape_numel(&out_node->shape);
-    _append(out, out_size, &pos, "    memcpy(out_ptr, %s, %zu * sizeof(%s));\n",
-            out_vname, out_numel, bafe_dtype_c_name(out_node->dtype));
+    if (out_node->dtype == BAFE_DTYPE_F16) {
+        _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) out_ptr[i] = bafe_f32_to_f16(%s[i]);\n",
+                out_numel, out_vname);
+    } else if (out_node->dtype == BAFE_DTYPE_BF16) {
+        _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) out_ptr[i] = bafe_f32_to_bf16(%s[i]);\n",
+                out_numel, out_vname);
+    } else {
+        _append(out, out_size, &pos, "    memcpy(out_ptr, %s, %zu * sizeof(%s));\n",
+                out_vname, out_numel, bafe_dtype_c_name(out_node->dtype));
+    }
     _append(out, out_size, &pos, "}\n");
 
     return (int)pos;
