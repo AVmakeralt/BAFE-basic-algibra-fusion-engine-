@@ -302,6 +302,51 @@ _lib.bafe_fuse_compile.argtypes = [POINTER(BafeGraph), POINTER(BafeGraph),
 _lib.bafe_fuse_compile.restype = c_void_p
 
 
+# Phase 3 (issue #4): multi-tier pruning with time budget
+class BafePruningConfig(Structure):
+    _fields_ = [
+        ("time_budget_ms", c_int),
+        ("max_nodes", c_int),
+        ("max_rewrites", c_int),
+        ("max_egraph_size", c_int),
+        ("beam_width", c_int),
+        ("heuristic_threshold", c_double),
+        ("temperature", c_double),
+        ("seed", c_uint32),
+        ("enable_anytime", c_bool),
+    ]
+
+
+class BafePruningStats(Structure):
+    _fields_ = [
+        ("regime", c_int),
+        ("tier_a_passed", c_int),
+        ("tier_b_passed", c_int),
+        ("tier_c_kept", c_int),
+        ("tier_d_materialized", c_int),
+        ("total_alts_found", c_int),
+        ("best_cost", c_int),
+        ("elapsed_ms", c_double),
+        ("was_interrupted", c_bool),
+    ]
+
+
+_lib.bafe_pruning_config_default.argtypes = []
+_lib.bafe_pruning_config_default.restype = BafePruningConfig
+_lib.bafe_pruning_regime_from_budget.argtypes = [c_int]
+_lib.bafe_pruning_regime_from_budget.restype = c_int
+_lib.bafe_pruning_beam_width_for_regime.argtypes = [c_int]
+_lib.bafe_pruning_beam_width_for_regime.restype = c_int
+_lib.bafe_pruning_iters_for_regime.argtypes = [c_int]
+_lib.bafe_pruning_iters_for_regime.restype = c_int
+_lib.bafe_pruning_run.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList),
+                                   POINTER(BafePruningConfig), POINTER(BafePruningStats)]
+_lib.bafe_pruning_run.restype = c_int
+_lib.bafe_pruning_run_with_budget.argtypes = [POINTER(BafeGraph), POINTER(BafeAltList),
+                                               c_int, POINTER(BafePruningStats)]
+_lib.bafe_pruning_run_with_budget.restype = c_int
+
+
 # types
 _lib.bafe_dtype_c_name.argtypes = [c_int]
 _lib.bafe_dtype_c_name.restype = c_char_p

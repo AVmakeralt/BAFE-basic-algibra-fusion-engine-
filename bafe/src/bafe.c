@@ -14,6 +14,7 @@
 #include "bafe/rewrite.h"
 #include "bafe/codegen.h"
 #include "bafe/search.h"
+#include "bafe/pruning.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -41,22 +42,42 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
     for (int i = 0; i < input->n_outputs; i++) work.outputs[i] = input->outputs[i];
     work.n_outputs = input->n_outputs;
 
-    /* Step 1: run stochastic multi-pass search on the working copy.
-     * This materializes selected alternatives as new nodes, which the
-     * next pass can match rules against — discovering deeper rewrites. */
+    /* Step 1: run search on the working copy.
+     *
+     * Phase 3 (issue #4): if a time_budget_ms > 0 is specified, use the
+     * multi-tier pruning controller (Levels A/B/C/D with anytime property).
+     * Otherwise, fall back to the existing stochastic search.
+     */
     bafe_alt_list alts;
-    bafe_search_stats search_stats;
-    int n_alts = bafe_rewrite_stochastic_stats(&work, &alts, &budget, &search_stats);
-    (void)n_alts;
-    (void)search_stats;
-
+    if (budget.time_budget_ms > 0) {
+        /* Use the pruning controller */
+        bafe_pruning_config pc = bafe_pruning_config_default();
+        pc.time_budget_ms = budget.time_budget_ms;
+        pc.max_nodes = budget.max_nodes;
+        pc.max_rewrites = budget.max_rewrites;
+        pc.temperature = budget.temperature;
+        pc.seed = budget.seed;
+        bafe_pruning_stats pstats;
+        bafe_pruning_run(&work, &alts, &pc, &pstats);
 #ifdef BAFE_DEBUG
-    printf("[bafe_optimize] stochastic search: %d iters, %d alts found, %d materialized, %d nodes added\n",
-           search_stats.iters_done, search_stats.alts_found,
-           search_stats.alts_materialized, search_stats.nodes_added);
-    printf("[bafe_optimize] working graph grew from %d to %d nodes\n",
-           input->n_nodes, work.n_nodes);
+        printf("[bafe_optimize] pruning controller: regime=%d, alts=%d, "
+               "tier_a=%d, tier_b=%d, tier_c=%d, tier_d=%d, elapsed=%.2fms\n",
+               pstats.regime, pstats.total_alts_found,
+               pstats.tier_a_passed, pstats.tier_b_passed,
+               pstats.tier_c_kept, pstats.tier_d_materialized, pstats.elapsed_ms);
 #endif
+    } else {
+        /* Use the existing stochastic search */
+        bafe_search_stats search_stats;
+        int n_alts = bafe_rewrite_stochastic_stats(&work, &alts, &budget, &search_stats);
+        (void)n_alts;
+        (void)search_stats;
+#ifdef BAFE_DEBUG
+        printf("[bafe_optimize] stochastic search: %d iters, %d alts found, %d materialized\n",
+               search_stats.iters_done, search_stats.alts_found,
+               search_stats.alts_materialized);
+#endif
+    }
 
     /* Step 2: import the (possibly expanded) working graph into e-graph */
     bafe_egraph *eg = (bafe_egraph *)malloc(sizeof(bafe_egraph));

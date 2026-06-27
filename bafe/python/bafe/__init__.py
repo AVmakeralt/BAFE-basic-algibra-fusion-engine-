@@ -311,10 +311,11 @@ class JittedFunction:
     multi-pass search to discover deeper rewrites.
     """
 
-    def __init__(self, fn: Callable, budget=None, autotune=False):
+    def __init__(self, fn: Callable, budget=None, autotune=False, time_budget_ms=None):
         self._fn = fn
         self._budget = budget  # BafeSearchBudget or None (deterministic)
         self._autotune = autotune  # Phase 3: enable autotune loop
+        self._time_budget_ms = time_budget_ms  # Phase 3 (issue #4): pruning time budget
         self._compiled = {}  # key: (shapes, dtypes, layouts) -> compiled tuple
         self._call_count = {}  # key -> call number (for warmup tracking)
         functools.update_wrapper(self, fn)
@@ -462,13 +463,21 @@ class JittedFunction:
 
         # optimize + compile
         # Phase 2 (issue #1): if a budget is set, use stochastic multi-pass search
+        # Phase 3 (issue #4): if time_budget_ms is set, use the pruning controller
         optimized = BafeGraph()
         err_buf = ctypes.create_string_buffer(256)
-        if self._budget is not None:
+        if self._budget is not None or self._time_budget_ms is not None:
+            # build a budget struct
+            if self._budget is not None:
+                budget = self._budget
+            else:
+                budget = _lib.bafe_search_budget_default()
+            if self._time_budget_ms is not None:
+                budget.time_budget_ms = int(self._time_budget_ms)
             rc = _lib.bafe_optimize_with_budget(
                 ctypes.byref(in_graph),
                 ctypes.byref(optimized),
-                ctypes.byref(self._budget),
+                ctypes.byref(budget),
                 err_buf,
                 ctypes.c_size_t(len(err_buf)),
             )
@@ -524,54 +533,52 @@ class JittedFunction:
 
 
 def jit(fn: Callable = None, *, budget=None, iters: int = None,
-        temperature: float = None, seed: int = None, autotune: bool = False):
+        temperature: float = None, seed: int = None, autotune: bool = False,
+        time_budget_ms: int = None):
     """Decorator: trace + optimize + JIT-compile a tensor function.
 
     Phase 2 (issue #1): optional stochastic search parameters.
+    Phase 3 (issue #4): optional time-budget pruning.
     Phase 3 (issue #6): optional autotune loop.
 
     Args:
-        budget: a BafeSearchBudget for full control. If None and no other
-                params are given, uses deterministic single-pass search.
+        budget: a BafeSearchBudget for full control.
         iters: number of stochastic passes (default 4 if budget mode on).
         temperature: 0.0 = greedy, high = explore randomly (default 1.0).
         seed: PRNG seed for reproducibility (default 0xBAFE5EED).
-        autotune: if True, enable the auto-tuning loop. Each call is timed,
-                  logged, and after enough samples the cost model is refit
-                  via linear regression on observed runtimes.
+        autotune: if True, enable the auto-tuning loop.
+        time_budget_ms: wall-clock limit for the optimization search.
+            Controls the pruning regime:
+              <= 1 ms:   greedy (Level A+B only, beam=1)
+              <= 10 ms:  light (A+B+C, beam=4)
+              <= 100 ms: beam (A+B+C+D, beam=16)
+              > 100 ms:  deep (all tiers, beam=64)
+            0 or None means no limit (uses stochastic search).
 
     Examples:
         @bafe.jit
         def f(A, B): ...                      # deterministic (default)
 
-        @bafe.jit(iters=8, temperature=2.0)
-        def f(A, B): ...                      # stochastic, 8 passes
+        @bafe.jit(time_budget_ms=100)
+        def f(A, B): ...                      # 100ms pruning budget
 
-        @bafe.jit(autotune=True)
-        def f(A, B): ...                      # autotune enabled
-
-        @bafe.jit(autotune=True, iters=4)
-        def f(A, B): ...                      # stochastic + autotune
-
-        budget = bafe.make_search_budget(iters=16, max_nodes=500, seed=42)
-        @bafe.jit(budget=budget, autotune=True)
-        def f(A, B): ...                      # full custom budget + autotune
+        @bafe.jit(time_budget_ms=1000, autotune=True)
+        def f(A, B): ...                      # 1s budget + autotune
     """
-    # Support both @bafe.jit and @bafe.jit(...) usage
     if fn is not None:
-        # called as @bafe.jit (no parentheses)
-        return JittedFunction(fn, autotune=autotune)
+        return JittedFunction(fn, autotune=autotune, time_budget_ms=time_budget_ms)
 
     def deco(fn):
         b = budget
         if b is None and (iters is not None or temperature is not None or seed is not None):
-            # build a budget from individual params
             b = make_search_budget(
                 max_iters=iters if iters is not None else 4,
                 temperature=temperature if temperature is not None else 1.0,
                 seed=seed if seed is not None else 0xBAFE5EED,
             )
-        return JittedFunction(fn, budget=b, autotune=autotune)
+        if b is not None and time_budget_ms is not None:
+            b.time_budget_ms = int(time_budget_ms)
+        return JittedFunction(fn, budget=b, autotune=autotune, time_budget_ms=time_budget_ms)
     return deco
 
 
@@ -922,5 +929,46 @@ __all__ = [
     "configure_autotune", "autotune_stats", "autotune_refit",
     "autotune_model", "autotune_dump_log", "autotune_reset",
     "calibrate", "calibrated_cost_model",
+    "pruning_regime_name", "pruning_beam_width", "pruning_iters",
     "__version__",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 (issue #4): Pruning controller helpers
+# ---------------------------------------------------------------------------
+
+_PRUNING_REGIMES = {
+    0: "greedy",
+    1: "light",
+    2: "beam",
+    3: "deep",
+}
+
+
+def pruning_regime_name(time_budget_ms: int) -> str:
+    """Get the regime name for a time budget.
+
+    Returns one of: "greedy" (<=1ms), "light" (<=10ms), "beam" (<=100ms),
+    "deep" (>100ms). 0 or None returns "deep" (no limit).
+    """
+    if time_budget_ms is None or time_budget_ms <= 0:
+        return "deep"
+    regime = _lib.bafe_pruning_regime_from_budget(int(time_budget_ms))
+    return _PRUNING_REGIMES.get(regime, "unknown")
+
+
+def pruning_beam_width(time_budget_ms: int) -> int:
+    """Get the beam width for a time budget's regime."""
+    if time_budget_ms is None or time_budget_ms <= 0:
+        time_budget_ms = 0
+    regime = _lib.bafe_pruning_regime_from_budget(int(time_budget_ms))
+    return _lib.bafe_pruning_beam_width_for_regime(regime)
+
+
+def pruning_iters(time_budget_ms: int) -> int:
+    """Get the number of stochastic iterations for a time budget's regime."""
+    if time_budget_ms is None or time_budget_ms <= 0:
+        time_budget_ms = 0
+    regime = _lib.bafe_pruning_regime_from_budget(int(time_budget_ms))
+    return _lib.bafe_pruning_iters_for_regime(regime)
