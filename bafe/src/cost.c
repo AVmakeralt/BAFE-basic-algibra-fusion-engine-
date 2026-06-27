@@ -121,36 +121,29 @@ double bafe_cost_layout_conversion(const bafe_cost_model *m,
                                     bafe_layout output_layout,
                                     const bafe_shape *inputs, int n_input_shapes) {
     (void)output_layout;
-    /* For elementwise binary ops (add/sub/mul): if input layouts differ,
-     * the codegen must convert one of them. Cost = epsilon * bytes_converted.
-     * For matmul: A row-major + B row-major means we transpose B on the fly
-     * (strided access), which is cache-unfriendly. Model this as a conversion.
-     */
+    /* Determine the element size from the first input's dtype.
+     * Since we don't have dtype here, we use F32 (4 bytes) as the default.
+     * The cost model already scales by epsilon, so this is approximate. */
+    const size_t elem_size = 4;  /* F32 default */
+
     if (n_inputs < 2) return 0.0;
     if (strcmp(op_name, "matmul") == 0 || bafe_op_is_fused(op_name)) {
-        /* For matmul-family ops, the "natural" access is A row-major + B col-major.
-         * If both are row-major, B is accessed with stride-N reads (cache-unfriendly).
-         * Model this as a "virtual conversion" of B to col-major.
-         */
         if (n_inputs >= 2 && input_layouts[0] == BAFE_LAYOUT_ROW_MAJOR
                           && input_layouts[1] == BAFE_LAYOUT_ROW_MAJOR) {
-            /* cost = epsilon * bytes_of_B */
             if (n_input_shapes >= 2) {
-                size_t b_bytes = bafe_shape_numel(&inputs[1]) * 4; /* assume f32 */
+                size_t b_bytes = bafe_shape_numel(&inputs[1]) * elem_size;
                 return m->epsilon_layout_conv * (double)b_bytes;
             }
         }
         return 0.0;
     }
-    /* elementwise: if layouts differ, conversion needed */
     if (strcmp(op_name, "add") == 0 || strcmp(op_name, "sub") == 0 ||
         strcmp(op_name, "mul") == 0 || strcmp(op_name, "bias_add") == 0) {
         bafe_layout l0 = input_layouts[0];
         for (int i = 1; i < n_inputs; i++) {
             if (input_layouts[i] != l0) {
-                /* conversion needed: cost = epsilon * bytes_of_smaller_input */
                 if (i < n_input_shapes) {
-                    size_t bytes = bafe_shape_numel(&inputs[i]) * 4; /* assume f32 */
+                    size_t bytes = bafe_shape_numel(&inputs[i]) * elem_size;
                     return m->epsilon_layout_conv * (double)bytes;
                 }
             }

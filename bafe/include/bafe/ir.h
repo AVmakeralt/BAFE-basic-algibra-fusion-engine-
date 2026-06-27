@@ -24,7 +24,7 @@ extern "C" {
 #endif
 
 #define BAFE_MAX_CHILDREN 4
-#define BAFE_MAX_NODES    512
+#define BAFE_MAX_NODES    4096
 
 typedef int32_t bafe_node_id;
 

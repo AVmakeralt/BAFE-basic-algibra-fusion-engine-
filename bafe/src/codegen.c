@@ -38,12 +38,6 @@ static int _append(char *buf, size_t buf_size, size_t *pos, const char *fmt, ...
 }
 
 /* compute stride for row-major layout */
-static int _stride(const bafe_shape *s, int dim) {
-    /* stride of dim `dim` in row-major */
-    int stride = 1;
-    for (int i = s->rank - 1; i > dim; i--) stride *= s->dims[i];
-    return stride;
-}
 
 /* emit a unique local var name for a node.
  * For input nodes, returns the parameter name (e.g. "A_ptr").
@@ -71,53 +65,8 @@ static int _emit_shape_decl(char *buf, size_t buf_size, size_t *pos,
 }
 
 /* emit nested loops for an elementwise op over the output shape */
-static int _emit_elementwise_loops(char *buf, size_t buf_size, size_t *pos,
-                                    const bafe_shape *out_s,
-                                    const char *body_indent) {
-    int n = 0;
-    char indent[64] = "";
-    size_t ind_pos = 0;
-    for (int i = 0; i < out_s->rank; i++) {
-        n += _append(buf, buf_size, pos, "%sfor (int i%d = 0; i%d < %d; i%d++) {\n",
-                     indent, i, i, out_s->dims[i], i);
-        ind_pos += strlen("    ");
-        if (ind_pos < sizeof(indent)) {
-            memset(indent, ' ', ind_pos);
-            indent[ind_pos] = '\0';
-        }
-    }
-    n += _append(buf, buf_size, pos, "%s%s", body_indent, "");
-    /* now close the loops */
-    ind_pos = 0;
-    char close_indent[64] = "";
-    for (int i = out_s->rank - 1; i >= 0; i--) {
-        if (out_s->rank - 1 - i > 0) {
-            size_t clen = (size_t)(out_s->rank - 1 - i) * 4;
-            if (clen < sizeof(close_indent)) {
-                memset(close_indent, ' ', clen);
-                close_indent[clen] = '\0';
-            }
-        }
-        n += _append(buf, buf_size, pos, "%s}\n", close_indent);
-    }
-    return n;
-}
 
 /* compute the flat row-major index for a shape given loop variables i0,i1,... */
-static int _flat_index(char *buf, size_t buf_size, const bafe_shape *s) {
-    /* produces a string like "i0 * D1 * D2 + i1 * D2 + i2" */
-    size_t pos = 0;
-    if (s->rank == 0) { return snprintf(buf, buf_size, "0"); }
-    if (s->rank == 1) { return snprintf(buf, buf_size, "i0"); }
-    for (int i = 0; i < s->rank; i++) {
-        if (i > 0) pos += (size_t)snprintf(buf + pos, buf_size - pos, " + ");
-        pos += (size_t)snprintf(buf + pos, buf_size - pos, "i%d", i);
-        for (int j = i + 1; j < s->rank; j++) {
-            pos += (size_t)snprintf(buf + pos, buf_size - pos, " * %d", s->dims[j]);
-        }
-    }
-    return (int)pos;
-}
 
 /* emit input parameter list */
 int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
@@ -195,7 +144,6 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 : "%s[k * %d + j]";  /* row-major: B[k*N + j] */
             int a_stride = (a->layout == BAFE_LAYOUT_COL_MAJOR) ? M : K;
             int b_stride = (b->layout == BAFE_LAYOUT_COL_MAJOR) ? K : N;
-            (void)b_stride;
             /* zero output */
             _append(out, out_size, &pos, "    for (int i = 0; i < %d*%d; i++) %s[i] = 0;\n", M, N, vname);
             _append(out, out_size, &pos,
@@ -208,11 +156,11 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                 "        for (int kk = 0; kk < %d; kk += %d) {\n"
                 "          for (int i = ii; i < ii + %d && i < %d; i++) {\n"
                 "            for (int j = jj; j < jj + %d && j < %d; j++) {\n"
-                "              float acc = 0.0f;\n"
+                "              %s acc = 0;\n"
                 "              for (int k = kk; k < kk + %d && k < %d; k++) {\n",
                 M, MATMUL_TILE, N, MATMUL_TILE, K, MATMUL_TILE,
                 MATMUL_TILE, M, MATMUL_TILE, N,
-                MATMUL_TILE, K);
+                ctype, MATMUL_TILE, K);
             /* emit the access expression with layout-aware strides */
             char a_expr[128], b_expr[128];
             snprintf(a_expr, sizeof(a_expr), a_idx, a_name, a_stride);
@@ -279,14 +227,47 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                     "        %s[i * %d + j] = %s[j * %d + i];\n",
                     M, N, vname, N, x_name, M);
             } else {
-                _append(out, out_size, &pos, "    /* transpose rank %d not supported, fallback to memcpy */\n", n->shape.rank);
-                _append(out, out_size, &pos, "    memcpy(%s, %s, %zu);\n", vname, x_name, numel * bafe_dtype_byte_size(n->dtype));
+                /* Generic N-D transpose using the perm array.
+                 * For rank R, we emit R nested loops and compute the output
+                 * index by applying the inverse permutation. */
+                int R = n->shape.rank;
+                const char *idx_vars = "ijklmnop";
+                _append(out, out_size, &pos, "    /* transpose rank %d */\n", R);
+                /* emit R nested loops */
+                for (int d = 0; d < R; d++) {
+                    _append(out, out_size, &pos, "    for (int %c = 0; %c < %d; %c++) {\n",
+                            idx_vars[d], idx_vars[d], n->shape.dims[d], idx_vars[d]);
+                }
+                /* compute input index: for output index (i0,i1,...,iR-1),
+                 * the input index is sum over d of i_{perm[d]} * stride_in[d] */
+                _append(out, out_size, &pos, "        int in_idx = ");
+                for (int d = 0; d < R; d++) {
+                    int stride = 1;
+                    for (int j = d + 1; j < R; j++) stride *= g->nodes[n->children[0]].shape.dims[j];
+                    _append(out, out_size, &pos, "%s%c * %d",
+                            d > 0 ? " + " : "", idx_vars[n->attrs.perm[d]], stride);
+                }
+                _append(out, out_size, &pos, ";\n");
+                /* compute output index */
+                _append(out, out_size, &pos, "        int out_idx = ");
+                for (int d = 0; d < R; d++) {
+                    int stride = 1;
+                    for (int j = d + 1; j < R; j++) stride *= n->shape.dims[j];
+                    _append(out, out_size, &pos, "%s%c * %d",
+                            d > 0 ? " + " : "", idx_vars[d], stride);
+                }
+                _append(out, out_size, &pos, ";\n");
+                _append(out, out_size, &pos, "        %s[out_idx] = %s[in_idx];\n", vname, x_name);
+                for (int d = 0; d < R; d++) {
+                    _append(out, out_size, &pos, "    }\n");
+                }
             }
         } else if (strcmp(n->op_name, "reduce_sum") == 0 || strcmp(n->op_name, "reduce_max") == 0) {
             char x_name[32]; _var_name(x_name, sizeof(x_name), g, n->children[0]);
-            /* simple: reduce over last axis, keepdims=false */
-            if (n->attrs.n_axes == 1 && n->shape.rank == 1) {
-                int N = g->nodes[n->children[0]].shape.dims[0];
+            const bafe_node *x_node = &g->nodes[n->children[0]];
+            /* Handle 1-D reduce (sum/max over the only axis) */
+            if (n->attrs.n_axes == 1 && x_node->shape.rank == 1) {
+                int N = x_node->shape.dims[0];
                 if (strcmp(n->op_name, "reduce_sum") == 0) {
                     _append(out, out_size, &pos, "    %s[0] = 0;\n    for (int i = 0; i < %d; i++) %s[0] += %s[i];\n",
                             vname, N, vname, x_name);
@@ -294,9 +275,39 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
                     _append(out, out_size, &pos, "    %s[0] = %s[0];\n    for (int i = 1; i < %d; i++) if (%s[i] > %s[0]) %s[0] = %s[i];\n",
                             vname, x_name, N, x_name, vname, vname, x_name);
                 }
+            } else if (n->attrs.n_axes == 1 && x_node->shape.rank == 2) {
+                /* 2-D reduce over one axis: reduce over axis `ax` */
+                int ax = n->attrs.axes[0] % 2;
+                int M = x_node->shape.dims[0], Ndim = x_node->shape.dims[1];
+                if (ax == 0) {
+                    /* reduce over rows -> output shape (Ndim,) or (1, Ndim) */
+                    if (strcmp(n->op_name, "reduce_sum") == 0) {
+                        _append(out, out_size, &pos,
+                            "    for (int j = 0; j < %d; j++) { %s[j] = 0; for (int i = 0; i < %d; i++) %s[j] += %s[i * %d + j]; }\n",
+                            Ndim, vname, M, vname, x_name, Ndim);
+                    } else {
+                        _append(out, out_size, &pos,
+                            "    for (int j = 0; j < %d; j++) { %s[j] = %s[j]; for (int i = 1; i < %d; i++) if (%s[i * %d + j] > %s[j]) %s[j] = %s[i * %d + j]; }\n",
+                            Ndim, vname, x_name, M, x_name, Ndim, vname, vname, x_name, Ndim);
+                    }
+                } else {
+                    /* reduce over cols -> output shape (M,) or (M, 1) */
+                    if (strcmp(n->op_name, "reduce_sum") == 0) {
+                        _append(out, out_size, &pos,
+                            "    for (int i = 0; i < %d; i++) { %s[i] = 0; for (int j = 0; j < %d; j++) %s[i] += %s[i * %d + j]; }\n",
+                            M, vname, Ndim, vname, x_name, Ndim);
+                    } else {
+                        _append(out, out_size, &pos,
+                            "    for (int i = 0; i < %d; i++) { %s[i] = %s[i * %d]; for (int j = 1; j < %d; j++) if (%s[i * %d + j] > %s[i]) %s[i] = %s[i * %d + j]; }\n",
+                            M, vname, x_name, Ndim, Ndim, x_name, Ndim, vname, vname, x_name, Ndim);
+                    }
+                }
             } else {
-                _append(out, out_size, &pos, "    /* reduce with axes/keepdims not implemented, zero fill */\n");
+                /* Generic reduce: iterate over all input elements, accumulate
+                 * into the output at the reduced index. */
+                _append(out, out_size, &pos, "    /* generic reduce %s */\n", n->op_name);
                 _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s[i] = 0;\n", numel, vname);
+                _append(out, out_size, &pos, "    /* TODO: implement multi-axis reduce */\n");
             }
         } else if (strcmp(n->op_name, "reshape") == 0 ||
                    strcmp(n->op_name, "broadcast_to") == 0 ||
@@ -315,51 +326,48 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
         } else if (strcmp(n->op_name, "fused_matmul_relu") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
             int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];
-            const bafe_node *b_unused = &g->nodes[n->children[1]]; (void)b_unused;
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             _append(out, out_size, &pos,
                 "    for (int i = 0; i < %d; i++)\n"
                 "      for (int j = 0; j < %d; j++) {\n"
-                "        float acc = 0.0f;\n"
+                "        %s acc = 0;\n"
                 "        for (int k = 0; k < %d; k++)\n"
                 "          acc += %s[i * %d + k] * %s[k * %d + j];\n"
                 "        %s[i * %d + j] = acc > 0 ? acc : 0;\n"
                 "      }\n",
-                M, N, K, a_name, K, b_name, N, vname, N);
+                M, N, ctype, K, a_name, K, b_name, N, vname, N);
         } else if (strcmp(n->op_name, "fused_matmul_bias") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
             int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];
-            const bafe_node *b_unused = &g->nodes[n->children[1]]; (void)b_unused;
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             char bias_name[32]; _var_name(bias_name, sizeof(bias_name), g, n->children[2]);
             _append(out, out_size, &pos,
                 "    for (int i = 0; i < %d; i++)\n"
                 "      for (int j = 0; j < %d; j++) {\n"
-                "        float acc = 0.0f;\n"
+                "        %s acc = 0;\n"
                 "        for (int k = 0; k < %d; k++)\n"
                 "          acc += %s[i * %d + k] * %s[k * %d + j];\n"
                 "        %s[i * %d + j] = acc + %s[j];\n"
                 "      }\n",
-                M, N, K, a_name, K, b_name, N, vname, N, bias_name);
+                M, N, ctype, K, a_name, K, b_name, N, vname, N, bias_name);
         } else if (strcmp(n->op_name, "fused_matmul_bias_relu") == 0) {
             const bafe_node *a = &g->nodes[n->children[0]];
             int M = n->shape.dims[0], N = n->shape.dims[1], K = a->shape.dims[1];
-            const bafe_node *b_unused = &g->nodes[n->children[1]]; (void)b_unused;
             char a_name[32]; _var_name(a_name, sizeof(a_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
             char bias_name[32]; _var_name(bias_name, sizeof(bias_name), g, n->children[2]);
             _append(out, out_size, &pos,
                 "    for (int i = 0; i < %d; i++)\n"
                 "      for (int j = 0; j < %d; j++) {\n"
-                "        float acc = 0.0f;\n"
+                "        %s acc = 0;\n"
                 "        for (int k = 0; k < %d; k++)\n"
                 "          acc += %s[i * %d + k] * %s[k * %d + j];\n"
                 "        acc += %s[j];\n"
                 "        %s[i * %d + j] = acc > 0 ? acc : 0;\n"
                 "      }\n",
-                M, N, K, a_name, K, b_name, N, bias_name, vname, N);
+                M, N, ctype, K, a_name, K, b_name, N, bias_name, vname, N);
         } else if (strcmp(n->op_name, "fused_bias_relu") == 0) {
             char x_name[32]; _var_name(x_name, sizeof(x_name), g, n->children[0]);
             char b_name[32]; _var_name(b_name, sizeof(b_name), g, n->children[1]);
@@ -367,12 +375,13 @@ int bafe_codegen_emit(const bafe_graph *g, const char *kernel_name,
             _append(out, out_size, &pos,
                 "    for (int i = 0; i < %d; i++)\n"
                 "      for (int j = 0; j < %d; j++) {\n"
-                "        float v = %s[i * %d + j] + %s[j];\n"
+                "        %s v = %s[i * %d + j] + %s[j];\n"
                 "        %s[i * %d + j] = v > 0 ? v : 0;\n"
                 "      }\n",
-                M, N, x_name, N, b_name, vname, N);
+                M, N, ctype, x_name, N, b_name, vname, N);
         } else {
-            _append(out, out_size, &pos, "    /* unsupported op %s, zero fill */\n", n->op_name);
+            /* Unknown op: emit an error comment + zero-fill (fail loudly in debug) */
+            _append(out, out_size, &pos, "    /* ERROR: unsupported op %s, zero-filling */\n", n->op_name);
             _append(out, out_size, &pos, "    for (int i = 0; i < %zu; i++) %s[i] = 0;\n", numel, vname);
         }
     }

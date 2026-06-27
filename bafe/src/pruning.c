@@ -102,17 +102,35 @@ static bool _level_a_valid(const bafe_graph *g, const bafe_alternative *alt) {
 static double _level_b_score(const bafe_graph *g, const bafe_alternative *alt) {
     bafe_cost_model cm = bafe_cost_model_default();
     const bafe_node *orig = &g->nodes[alt->original_node_id];
-    bafe_shape dummy_inputs[BAFE_MAX_CHILDREN];
-    bafe_shape dummy_out = bafe_shape_make_2(1, 1);
-    for (int i = 0; i < alt->n_children && i < BAFE_MAX_CHILDREN; i++) {
-        dummy_inputs[i] = bafe_shape_make_2(1, 1);
+
+    /* Use real shapes from the graph nodes */
+    bafe_shape orig_inputs[BAFE_MAX_CHILDREN];
+    bafe_shape alt_inputs[BAFE_MAX_CHILDREN];
+    for (int i = 0; i < orig->n_children && i < BAFE_MAX_CHILDREN; i++) {
+        orig_inputs[i] = g->nodes[orig->children[i]].shape;
     }
-    double orig_cost = bafe_cost_node(&cm, orig->op_name, dummy_inputs,
+    for (int i = 0; i < alt->n_children && i < BAFE_MAX_CHILDREN; i++) {
+        alt_inputs[i] = g->nodes[alt->children[i]].shape;
+    }
+
+    /* Infer output shapes using the ops' shape functions */
+    const bafe_op *orig_op = bafe_op_get(orig->op_name);
+    bafe_shape orig_out = orig_op && orig_op->shape_fn
+        ? orig_op->shape_fn(orig_inputs, orig->n_children, &orig->attrs)
+        : bafe_shape_make_2(1, 1);
+    const bafe_op *alt_op = bafe_op_get(alt->op_name);
+    bafe_shape alt_out = alt_op && alt_op->shape_fn
+        ? alt_op->shape_fn(alt_inputs, alt->n_children, &alt->attrs)
+        : bafe_shape_make_2(1, 1);
+
+    bafe_dtype dtype = orig->n_children > 0 ? g->nodes[orig->children[0]].dtype : BAFE_DTYPE_F32;
+
+    double orig_cost = bafe_cost_node(&cm, orig->op_name, orig_inputs,
                                        orig->n_children, &orig->attrs,
-                                       &dummy_out, BAFE_DTYPE_F32);
-    double alt_cost = bafe_cost_node(&cm, alt->op_name, dummy_inputs,
+                                       &orig_out, dtype);
+    double alt_cost = bafe_cost_node(&cm, alt->op_name, alt_inputs,
                                       alt->n_children, &alt->attrs,
-                                      &dummy_out, BAFE_DTYPE_F32);
+                                      &alt_out, dtype);
     return alt_cost - orig_cost;
 }
 

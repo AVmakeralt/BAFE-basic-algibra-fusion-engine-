@@ -6,6 +6,7 @@
  */
 #include "bafe/extract.h"
 #include "bafe/ops.h"
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -15,40 +16,76 @@ static bafe_eclass_id _find_nonconst(bafe_egraph *eg, bafe_eclass_id x) {
     return bafe_egraph_find(eg, x);
 }
 
-static double _node_cost(const bafe_cost_model *m, const bafe_graph *g,
-                         const bafe_enode *e, const bafe_graph *g_for_shapes,
-                         const bafe_eclass_id *eclass_to_shape_src) {
-    /* We need input shapes for the cost computation. We use the shapes
-     * from the graph that was imported into the e-graph.
-     *
-     * Strategy: for each e-class, we record a representative shape (from
-     * the first imported node that maps to that class). This is passed in
-     * via g_for_shapes; we look up shapes per child e-class id by
-     * iterating over the original graph's nodes.
-     *
-     * For simplicity in Phase 1, we use the shape stored on the enode's
-     * "first" appearance in the graph. We pre-compute a class -> shape
-     * mapping in the caller.
-     */
-    (void)g_for_shapes; (void)eclass_to_shape_src; (void)g;
-    /* Phase 1 simplification: use a coarse cost that only depends on the
-     * op_name and number of children. The full shape-aware cost requires
-     * a class -> shape mapping, which we approximate here. */
-    bafe_shape dummy_inputs[BAFE_MAX_CHILDREN];
-    bafe_shape dummy_out = bafe_shape_make_2(1, 1);
-    for (int i = 0; i < e->n_children; i++) dummy_inputs[i] = bafe_shape_make_2(1, 1);
-    /* Use shape (1,1) for everything; the absolute cost numbers don't
-     * matter, only the RELATIVE ranking. The fusion bonus is what
-     * actually drives the extractor to prefer fused forms. */
-    return bafe_cost_node(m, e->op_name, dummy_inputs, e->n_children, &e->attrs, &dummy_out, BAFE_DTYPE_F32);
+/* Build an eclass -> shape mapping from the graph + node_to_eclass.
+ * For each eclass, we use the shape of the first graph node that maps to it. */
+static void _build_eclass_shapes(const bafe_egraph *eg,
+                                  const bafe_graph *g,
+                                  const bafe_eclass_id *node_to_eclass,
+                                  bafe_shape *eclass_shapes, /* size = n_total_classes_allocated */
+                                  bafe_dtype *eclass_dtypes) {
+    for (int i = 0; i < eg->n_total_classes_allocated; i++) {
+        eclass_shapes[i] = bafe_shape_scalar();
+        eclass_dtypes[i] = BAFE_DTYPE_F32;
+    }
+    if (!node_to_eclass || !g) return;
+    for (int nid = 0; nid < g->n_nodes; nid++) {
+        bafe_eclass_id cid = bafe_egraph_find((bafe_egraph *)eg, node_to_eclass[nid]);
+        if (cid >= 0 && cid < eg->n_total_classes_allocated) {
+            /* use the first node's shape (they should all be equivalent) */
+            if (bafe_shape_numel(&eclass_shapes[cid]) <= 1) {
+                eclass_shapes[cid] = g->nodes[nid].shape;
+                eclass_dtypes[cid] = g->nodes[nid].dtype;
+            }
+        }
+    }
+}
+
+static double _node_cost(const bafe_cost_model *m,
+                         const bafe_enode *e,
+                         const bafe_shape *eclass_shapes,
+                         const bafe_dtype *eclass_dtypes) {
+    bafe_shape inputs[BAFE_MAX_CHILDREN];
+    bafe_shape out_shape = bafe_shape_scalar();
+    bafe_dtype dtype = BAFE_DTYPE_F32;
+
+    for (int i = 0; i < e->n_children && i < BAFE_MAX_CHILDREN; i++) {
+        bafe_eclass_id child = e->children[i];
+        if (child >= 0 && child < 1024) {  /* bounds check */
+            inputs[i] = eclass_shapes[child];
+            if (i == 0) dtype = eclass_dtypes[child];
+        } else {
+            inputs[i] = bafe_shape_make_2(1, 1);
+        }
+    }
+
+    /* infer output shape using the op's shape function */
+    const bafe_op *op = bafe_op_get(e->op_name);
+    if (op && op->shape_fn) {
+        out_shape = op->shape_fn(inputs, e->n_children, &e->attrs);
+    }
+
+    return bafe_cost_node(m, e->op_name, inputs, e->n_children,
+                          &e->attrs, &out_shape, dtype);
 }
 
 void bafe_extract_run(const bafe_egraph *eg_, const bafe_cost_model *m,
                       const bafe_graph *g_for_shapes,
+                      const bafe_eclass_id *node_to_eclass,
                       bafe_plan *plan, int *eclass_to_plan) {
     bafe_egraph *eg = (bafe_egraph *)eg_;  /* cast away const for find() */
     plan->n = 0;
     int n_classes = eg->n_total_classes_allocated;
+
+    /* Build eclass -> shape mapping for shape-aware cost computation.
+     * Heap-allocated because BAFE_EG_MAX_CLASSES can be large. */
+    bafe_shape *eclass_shapes = (bafe_shape *)malloc(sizeof(bafe_shape) * BAFE_EG_MAX_CLASSES);
+    bafe_dtype *eclass_dtypes = (bafe_dtype *)malloc(sizeof(bafe_dtype) * BAFE_EG_MAX_CLASSES);
+    if (!eclass_shapes || !eclass_dtypes) {
+        free(eclass_shapes); free(eclass_dtypes);
+        return;
+    }
+    _build_eclass_shapes(eg, g_for_shapes, node_to_eclass,
+                         eclass_shapes, eclass_dtypes);
 
     /* Initialize each class's plan with +inf cost. */
     for (int cid = 0; cid < n_classes; cid++) {
@@ -96,7 +133,7 @@ void bafe_extract_run(const bafe_egraph *eg_, const bafe_cost_model *m,
                     child_plan[j] = child_idx;
                 }
                 if (!children_ok) continue;
-                double node_c = _node_cost(m, NULL, e, g_for_shapes, NULL);
+                double node_c = _node_cost(m, e, eclass_shapes, eclass_dtypes);
                 double total = node_c + child_total;
                 if (total < best->cost) {
                     best->enode = *e;
@@ -108,6 +145,8 @@ void bafe_extract_run(const bafe_egraph *eg_, const bafe_cost_model *m,
         }
     }
     (void)g_for_shapes;
+    free(eclass_shapes);
+    free(eclass_dtypes);
 }
 
 bafe_node_id bafe_extract_build_graph(const bafe_egraph *eg,

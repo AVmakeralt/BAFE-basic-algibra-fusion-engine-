@@ -27,9 +27,15 @@ from ctypes import (
 # ---------------------------------------------------------------------------
 
 def _find_library() -> str:
+    # 1. BAFE_LIB env var (for development/testing)
     env = os.environ.get("BAFE_LIB")
     if env and Path(env).exists():
         return env
+    # 2. Bundled .so (next to _binding.py, for pip-installed packages)
+    bundled = Path(__file__).resolve().parent / "libbafe.so"
+    if bundled.exists():
+        return str(bundled)
+    # 3. Development paths
     candidates = [
         Path(__file__).resolve().parent.parent.parent / "bafe" / "build" / "libbafe.so",
         Path(__file__).resolve().parent.parent / "build" / "libbafe.so",
@@ -39,7 +45,7 @@ def _find_library() -> str:
     for c in candidates:
         if c.exists():
             return str(c)
-    # last resort: let ctypes try system paths
+    # 4. System library paths
     found = ctypes.util.find_library("bafe")  # type: ignore[attr-defined]
     if found:
         return found
@@ -79,7 +85,7 @@ class BafeOpAttrs(Structure):
     ]
 
 
-BAFE_MAX_NODES = 512
+BAFE_MAX_NODES = 4096
 
 
 class BafeNode(Structure):
@@ -111,7 +117,7 @@ class BafeGraph(Structure):
 
 
 # Phase 2: rewrite alternatives (used by tests)
-BAFE_MAX_ALTERNATIVES = 512
+BAFE_MAX_ALTERNATIVES = 1024
 
 
 class BafeAlternative(Structure):

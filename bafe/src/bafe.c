@@ -27,20 +27,26 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
 
     bafe_graph_init(optimized);
 
-    /* Step 0: make a working copy of the input graph.
-     * The stochastic search mutates the graph (adds new nodes when
-     * materializing alternatives), so we must not touch the caller's input. */
-    bafe_graph work;
-    bafe_graph_init(&work);
+    /* Step 0: make a working copy of the input graph (heap-allocated — the
+     * struct is too large for the stack with BAFE_MAX_NODES=4096). */
+    bafe_graph *work = (bafe_graph *)malloc(sizeof(bafe_graph));
+    bafe_alt_list *alts = (bafe_alt_list *)malloc(sizeof(bafe_alt_list));
+    if (!work || !alts) {
+        if (err_buf) snprintf(err_buf, err_buf_size, "out of memory");
+        free(work); free(alts);
+        return 7;
+    }
+    bafe_graph_init(work);
+    alts->n = 0;
     /* copy nodes from input -> work */
     for (int i = 0; i < input->n_nodes; i++) {
-        work.nodes[i] = input->nodes[i];
+        work->nodes[i] = input->nodes[i];
     }
-    work.n_nodes = input->n_nodes;
-    for (int i = 0; i < input->n_inputs; i++) work.inputs[i] = input->inputs[i];
-    work.n_inputs = input->n_inputs;
-    for (int i = 0; i < input->n_outputs; i++) work.outputs[i] = input->outputs[i];
-    work.n_outputs = input->n_outputs;
+    work->n_nodes = input->n_nodes;
+    for (int i = 0; i < input->n_inputs; i++) work->inputs[i] = input->inputs[i];
+    work->n_inputs = input->n_inputs;
+    for (int i = 0; i < input->n_outputs; i++) work->outputs[i] = input->outputs[i];
+    work->n_outputs = input->n_outputs;
 
     /* Step 1: run search on the working copy.
      *
@@ -48,7 +54,6 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
      * multi-tier pruning controller (Levels A/B/C/D with anytime property).
      * Otherwise, fall back to the existing stochastic search.
      */
-    bafe_alt_list alts;
     if (budget.time_budget_ms > 0) {
         /* Use the pruning controller */
         bafe_pruning_config pc = bafe_pruning_config_default();
@@ -58,7 +63,7 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
         pc.temperature = budget.temperature;
         pc.seed = budget.seed;
         bafe_pruning_stats pstats;
-        bafe_pruning_run(&work, &alts, &pc, &pstats);
+        bafe_pruning_run(work, alts, &pc, &pstats);
 #ifdef BAFE_DEBUG
         printf("[bafe_optimize] pruning controller: regime=%d, alts=%d, "
                "tier_a=%d, tier_b=%d, tier_c=%d, tier_d=%d, elapsed=%.2fms\n",
@@ -69,7 +74,7 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
     } else {
         /* Use the existing stochastic search */
         bafe_search_stats search_stats;
-        int n_alts = bafe_rewrite_stochastic_stats(&work, &alts, &budget, &search_stats);
+        int n_alts = bafe_rewrite_stochastic_stats(work, alts, &budget, &search_stats);
         (void)n_alts;
         (void)search_stats;
 #ifdef BAFE_DEBUG
@@ -87,8 +92,8 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
     }
     bafe_egraph_init(eg);
     bafe_eclass_id node_to_eclass[BAFE_MAX_NODES];
-    for (int i = 0; i < work.n_nodes; i++) node_to_eclass[i] = -1;
-    bafe_egraph_import_graph(eg, &work, node_to_eclass);
+    for (int i = 0; i < BAFE_MAX_NODES; i++) node_to_eclass[i] = -1;
+    bafe_egraph_import_graph(eg, work, node_to_eclass);
 
 #ifdef BAFE_DEBUG
     {
@@ -99,7 +104,7 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
 #endif
 
     /* Step 3: apply alternatives (declare equivalences) */
-    bafe_egraph_apply_alternatives(eg, &work, node_to_eclass, &alts);
+    bafe_egraph_apply_alternatives(eg, work, node_to_eclass, alts);
 
     /* Step 4: rebuild (congruence closure) */
     int iters = bafe_egraph_rebuild(eg, 100);
@@ -117,17 +122,18 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
      * Phase 3 (issue #5): use the calibrated cost model if a learned model
      * is available; otherwise fall back to the static default. */
     bafe_cost_model cm = bafe_cost_model_calibrated_default();
-    bafe_plan plan;
+    bafe_plan *plan = (bafe_plan *)malloc(sizeof(bafe_plan));
+    if (!plan) { free(eg); free(work); free(alts); if (err_buf) snprintf(err_buf, err_buf_size, "oom"); return 7; }
     int eclass_to_plan[BAFE_EG_MAX_CLASSES];
-    bafe_extract_run(eg, &cm, &work, &plan, eclass_to_plan);
+    bafe_extract_run(eg, &cm, work, node_to_eclass, plan, eclass_to_plan);
 
     /* Step 6: build optimized graph from extraction */
-    if (work.n_outputs == 0) {
+    if (work->n_outputs == 0) {
         if (err_buf) snprintf(err_buf, err_buf_size, "input has no outputs");
         free(eg);
         return 1;
     }
-    bafe_eclass_id root_eclass = node_to_eclass[work.outputs[0]];
+    bafe_eclass_id root_eclass = node_to_eclass[work->outputs[0]];
 
     bafe_eclass_id new_eclass_to_node[BAFE_EG_MAX_CLASSES];
     for (int i = 0; i < BAFE_EG_MAX_CLASSES; i++) new_eclass_to_node[i] = -1;
@@ -135,8 +141,8 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
     /* map from eclass -> original input node id (for shape/name recovery) */
     bafe_node_id eclass_to_input_origin[BAFE_EG_MAX_CLASSES];
     for (int i = 0; i < BAFE_EG_MAX_CLASSES; i++) eclass_to_input_origin[i] = -1;
-    for (int i = 0; i < work.n_inputs; i++) {
-        bafe_node_id nid = work.inputs[i];
+    for (int i = 0; i < work->n_inputs; i++) {
+        bafe_node_id nid = work->inputs[i];
         bafe_eclass_id cid = bafe_egraph_find(eg, node_to_eclass[nid]);
         eclass_to_input_origin[cid] = nid;
     }
@@ -165,7 +171,7 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
             free(eg);
             return 2;
         }
-        const bafe_plan_node *p = &plan.items[plan_idx];
+        const bafe_plan_node *p = &plan->items[plan_idx];
         if (p->enode.op_name == NULL) {
             if (err_buf) snprintf(err_buf, err_buf_size, "no enode chosen for eclass %d", cid);
             free(eg);
@@ -179,7 +185,7 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
                     free(eg);
                     return 3;
                 }
-                const bafe_node *orig_node = &work.nodes[orig];
+                const bafe_node *orig_node = &work->nodes[orig];
                 bafe_node_id new_id = bafe_graph_add_input_with_layout(
                     optimized, orig_node->input_name,
                     &orig_node->shape, orig_node->dtype, orig_node->layout);
@@ -235,6 +241,9 @@ int bafe_optimize_with_budget(const bafe_graph *input, bafe_graph *optimized,
     }
     bafe_graph_set_output(optimized, root_node);
     free(eg);
+    free(work);
+    free(alts);
+    free(plan);
     return 0;
 }
 
@@ -298,12 +307,12 @@ void bafe_optimize_debug(const bafe_graph *input) {
     bafe_egraph_init(eg);
     bafe_eclass_id node_to_eclass[BAFE_MAX_NODES];
     bafe_egraph_import_graph(eg, input, node_to_eclass);
-    bafe_alt_list alts;
-    bafe_rewrite_find(input, &alts);
-    bafe_egraph_apply_alternatives(eg, input, node_to_eclass, &alts);
+    bafe_alt_list alts_dbg;
+    bafe_rewrite_find(input, &alts_dbg);
+    bafe_egraph_apply_alternatives(eg, input, node_to_eclass, &alts_dbg);
     int iters = bafe_egraph_rebuild(eg, 100);
     printf("E-graph: %d classes, %d enodes, %d rebuild iters, %d alternatives\n",
-           bafe_egraph_num_classes(eg), bafe_egraph_num_enodes(eg), iters, alts.n);
+           bafe_egraph_num_classes(eg), bafe_egraph_num_enodes(eg), iters, alts_dbg.n);
     free(eg);
 
     /* show emitted C source */

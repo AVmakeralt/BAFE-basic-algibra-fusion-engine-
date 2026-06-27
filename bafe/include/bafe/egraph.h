@@ -25,10 +25,10 @@
 extern "C" {
 #endif
 
-#define BAFE_EG_MAX_NODES    1024
-#define BAFE_EG_MAX_CLASSES  1024
+#define BAFE_EG_MAX_NODES    4096
+#define BAFE_EG_MAX_CLASSES  4096
 #define BAFE_EG_MAX_ENODES_PER_CLASS 16
-#define BAFE_EG_MAX_PENDING  512
+#define BAFE_EG_MAX_PENDING  1024
 
 typedef int32_t bafe_eclass_id;
 

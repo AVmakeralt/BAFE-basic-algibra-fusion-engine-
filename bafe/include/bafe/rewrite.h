@@ -18,7 +18,7 @@ extern "C" {
 #endif
 
 #define BAFE_MAX_RULES 64
-#define BAFE_MAX_ALTERNATIVES 512
+#define BAFE_MAX_ALTERNATIVES 1024
 
 typedef struct {
     bafe_node_id   original_node_id;   /* the node being rewritten */

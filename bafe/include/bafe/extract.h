@@ -32,9 +32,13 @@ typedef struct {
 
 /* Run extraction. Returns a plan covering all e-classes.
  * Each e-class id maps to its best plan via the `eclass_to_plan` array
- * (caller-allocated, size = eg->n_total_classes_allocated). */
+ * (caller-allocated, size = eg->n_total_classes_allocated).
+ *
+ * `node_to_eclass` maps graph node ids to e-class ids (size = g_for_shapes->n_nodes).
+ * Pass NULL to use dummy (1,1) shapes (legacy behavior, not recommended). */
 void bafe_extract_run(const bafe_egraph *eg, const bafe_cost_model *m,
                       const bafe_graph *g_for_shapes,
+                      const bafe_eclass_id *node_to_eclass,
                       bafe_plan *plan, int *eclass_to_plan);
 
 /* Build a fresh graph containing only the chosen e-nodes, rooted at the

@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bafe"
+name = "bafe-engine"
 version = "0.1.0"
 description = "Basic Algebra Fusion Engine - C tensor-IR superoptimizer with Python binding"
 readme = "README.md"
@@ -12,11 +12,15 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "BAFE contributors" }]
 keywords = ["compiler", "tensor", "egraph", "superoptimizer", "mlir", "c"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: C",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Compilers",
 ]
 dependencies = [
@@ -33,10 +37,10 @@ Issues = "https://github.com/AVmakeralt/BAFE-basic-algibra-fusion-engine-/issues
 
 [tool.setuptools]
 packages = ["bafe"]
-package-dir = { "" = "python" }
+package-dir = { "" = "bafe/python" }
 
 [tool.setuptools.package-data]
-bafe = ["*.py"]
+bafe = ["libbafe.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
