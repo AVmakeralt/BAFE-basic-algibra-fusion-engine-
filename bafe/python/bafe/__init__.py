@@ -727,8 +727,195 @@ def calibrated_cost_model() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 (issue #7): Cross-kernel fusion
+# ---------------------------------------------------------------------------
+
+class FusedFunction:
+    """A fused kernel combining two jitted functions.
+
+    When you call `h = bafe.fuse(f, g)`, BAFE concatenates the two
+    optimized graphs (f's output feeds g's first input) and compiles
+    a single kernel. This avoids materializing the intermediate tensor.
+
+    The fused kernel takes f's inputs followed by g's inputs[1:].
+    """
+
+    def __init__(self, func_a: "JittedFunction", func_b: "JittedFunction"):
+        self._func_a = func_a
+        self._func_b = func_b
+        self._compiled = {}  # key: (shapes, dtypes, layouts) -> compiled tuple
+        # for fuse chaining: expose a _fn-like object with the combined arg count
+        # n_total = n_a_inputs + n_b_inputs - 1
+        class _FnShim:
+            def __init__(self, a_fn, b_fn):
+                self.__code__ = type("_Code", (), {
+                    "co_argcount": a_fn.__code__.co_argcount + b_fn.__code__.co_argcount - 1,
+                    "co_varnames": a_fn.__code__.co_varnames[:a_fn.__code__.co_argcount] + \
+                                   tuple(b_fn.__code__.co_varnames[1:b_fn.__code__.co_argcount]),
+                })()
+        self._fn = _FnShim(func_a._fn, func_b._fn)
+        functools.update_wrapper(self, func_a)
+
+    def __call__(self, *args: np.ndarray) -> np.ndarray:
+        if not args:
+            raise TypeError("fused function requires at least one input")
+
+        # split args: first len(a_inputs) go to f, rest go to g[1:]
+        # we need to know how many inputs f takes — infer from the first compile
+        # Actually, f takes some inputs, g takes some inputs, and f's output
+        # feeds g's first input. So total args = n_f_inputs + n_g_inputs - 1.
+        # We need to figure out the split.
+
+        # build cache key
+        def _layout_of(a):
+            if a.ndim >= 2 and a.flags["F_CONTIGUOUS"] and not a.flags["C_CONTIGUOUS"]:
+                return "col"
+            return "row"
+        key = tuple((a.shape, str(a.dtype), _layout_of(a)) for a in args)
+
+        if key not in self._compiled:
+            self._compiled[key] = self._compile(args)
+
+        fn_ptr, sig, in_dtypes, out_shape, out_dtype, _opt_graph, _hash, _pred = self._compiled[key]
+
+        # allocate output
+        out = np.zeros(out_shape, dtype=out_dtype)
+
+        # build arg list
+        c_args = []
+        for a, dt in zip(args, in_dtypes):
+            if a.dtype == dt:
+                arr = a
+            else:
+                if a.flags["F_CONTIGUOUS"] and not a.flags["C_CONTIGUOUS"]:
+                    arr = np.asfortranarray(a, dtype=dt)
+                else:
+                    arr = np.ascontiguousarray(a, dtype=dt)
+            c_args.append(arr.ctypes.data_as(ctypes.c_void_p))
+        c_args.append(out.ctypes.data_as(ctypes.c_void_p))
+
+        kernel = sig(fn_ptr)
+        kernel(*c_args)
+        return out
+
+    def _compile(self, args):
+        """Compile the fused function and return the 8-tuple matching
+        JittedFunction._compile (for fuse chaining)."""
+        # Figure out n_f_inputs by looking at f's signature
+        f_code = self._func_a._fn.__code__
+        n_f_inputs = f_code.co_argcount
+        g_code = self._func_b._fn.__code__
+        n_g_inputs = g_code.co_argcount
+
+        if len(args) != n_f_inputs + n_g_inputs - 1:
+            raise TypeError(
+                f"fused function expects {n_f_inputs + n_g_inputs - 1} args "
+                f"({n_f_inputs} for f + {n_g_inputs - 1} for g, since g's "
+                f"first input is f's output), got {len(args)}"
+            )
+
+        f_args = args[:n_f_inputs]
+        g_args = args[n_f_inputs:]
+
+        # compile f to get its optimized graph
+        f_result = self._func_a._compile(f_args)
+        f_fn_ptr, f_sig, f_in_dtypes, f_out_shape, f_out_dt, f_opt_graph, f_hash, f_pred = f_result
+
+        # For g, compile with a dummy first input matching f's output
+        dummy_f_out = np.zeros(f_out_shape, dtype=f_out_dt)
+        g_full_args = (dummy_f_out,) + g_args
+        g_result = self._func_b._compile(g_full_args)
+        g_opt_graph = g_result[5]
+
+        # Concatenate the two optimized graphs via the C API
+        fused_graph = BafeGraph()
+        err_buf = ctypes.create_string_buffer(256)
+        rc = _lib.bafe_fuse_concat(
+            ctypes.byref(f_opt_graph),
+            ctypes.byref(g_opt_graph),
+            ctypes.byref(fused_graph),
+            err_buf,
+            ctypes.c_size_t(len(err_buf)),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"bafe_fuse_concat failed (code {rc}): {err_buf.value.decode()}"
+            )
+
+        # Optimize + JIT compile the fused graph
+        optimized = BafeGraph()
+        rc = _lib.bafe_optimize(
+            ctypes.byref(fused_graph),
+            ctypes.byref(optimized),
+            err_buf,
+            ctypes.c_size_t(len(err_buf)),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"bafe_optimize failed for fused graph (code {rc}): {err_buf.value.decode()}"
+            )
+
+        fn_ptr = _lib.bafe_jit_get_or_compile(
+            ctypes.byref(optimized),
+            err_buf,
+            ctypes.c_size_t(len(err_buf)),
+        )
+        if not fn_ptr:
+            raise RuntimeError(
+                f"JIT compile failed for fused graph: {err_buf.value.decode()}"
+            )
+
+        # build the ctypes signature for the fused kernel
+        n_total_inputs = n_f_inputs + n_g_inputs - 1
+        sig = ctypes.CFUNCTYPE(None, *([ctypes.c_void_p] * (n_total_inputs + 1)))
+
+        in_dtypes = [a.dtype for a in args]
+
+        out_node = optimized.nodes[optimized.outputs[0]]
+        out_shape = tuple(out_node.shape.dims[i] for i in range(out_node.shape.rank))
+        out_dt = _BAFE_TO_NP[out_node.dtype]
+
+        # keep a copy of the optimized graph for autotune feature extraction
+        opt_graph_copy = BafeGraph()
+        ctypes.memmove(ctypes.byref(opt_graph_copy), ctypes.byref(optimized), ctypes.sizeof(BafeGraph))
+
+        graph_hash_buf = ctypes.create_string_buffer(65)
+        _lib.bafe_jit_hash_graph(ctypes.byref(optimized), graph_hash_buf, ctypes.c_size_t(65))
+        graph_hash = graph_hash_buf.value.decode("utf-8")
+
+        cm = _lib.bafe_cost_model_calibrated_default()
+        predicted = _lib.bafe_cost_graph(ctypes.byref(cm), ctypes.byref(optimized))
+
+        return (fn_ptr, sig, in_dtypes, out_shape, out_dt,
+                opt_graph_copy, graph_hash, predicted)
+
+
+def fuse(func_a, func_b):
+    """Fuse two jitted functions into a single kernel.
+
+    When `h = bafe.fuse(f, g)`, calling `h(a, b, c)` is equivalent to
+    `g(f(a, b), c)` but compiled as a single kernel — the intermediate
+    tensor (f's output) is never materialized.
+
+    Args:
+        func_a: a @bafe.jit-decorated function or FusedFunction (producer)
+        func_b: a @bafe.jit-decorated function or FusedFunction (consumer;
+                its first argument receives f's output)
+
+    Returns:
+        A FusedFunction that takes f's inputs + g's inputs[1:].
+    """
+    # Accept both JittedFunction and FusedFunction (for chaining)
+    if not isinstance(func_a, (JittedFunction, FusedFunction)):
+        raise TypeError("fuse() requires @bafe.jit-decorated or fused functions")
+    if not isinstance(func_b, (JittedFunction, FusedFunction)):
+        raise TypeError("fuse() requires @bafe.jit-decorated or fused functions")
+    return FusedFunction(func_a, func_b)
+
+
 __all__ = [
-    "Tensor", "jit", "optimize", "make_search_budget",
+    "Tensor", "jit", "optimize", "make_search_budget", "fuse",
     "input", "matmul", "add", "sub", "mul", "relu", "sigmoid", "tanh",
     "bias_add", "transpose", "reduce_sum", "reduce_max", "reshape", "broadcast_to",
     "graph_summary",

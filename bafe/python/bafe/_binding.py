@@ -293,6 +293,15 @@ _lib.bafe_jit_invalidate_memory_cache.argtypes = []
 _lib.bafe_jit_invalidate_memory_cache.restype = None
 
 
+# Phase 3 (issue #7): cross-kernel fusion
+_lib.bafe_fuse_concat.argtypes = [POINTER(BafeGraph), POINTER(BafeGraph),
+                                   POINTER(BafeGraph), c_char_p, c_size_t]
+_lib.bafe_fuse_concat.restype = c_int
+_lib.bafe_fuse_compile.argtypes = [POINTER(BafeGraph), POINTER(BafeGraph),
+                                    c_char_p, c_size_t]
+_lib.bafe_fuse_compile.restype = c_void_p
+
+
 # types
 _lib.bafe_dtype_c_name.argtypes = [c_int]
 _lib.bafe_dtype_c_name.restype = c_char_p
