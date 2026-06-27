@@ -26,7 +26,7 @@ from bafe._binding import (
     BAFE_MAX_NODES, BAFE_MAX_CHILDREN,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.3.1"
 
 # ---------------------------------------------------------------------------
 # Dtype mapping
